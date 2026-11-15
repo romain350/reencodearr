@@ -1,0 +1,23 @@
+# Agent Reencodearr en Docker, sur une machine Linux avec un GPU NVIDIA et le NVIDIA Container Toolkit.
+# 1. Dans l'interface du hub : Hosts -> Ajouter un host -> Linux. Copiez le code qui suit /enroll/ dans la commande.
+# 2. Remplissez HUB_URL et ENROLL_CODE ci-dessous, puis : docker compose -f docker-compose.agent.yml up -d
+# Le code ne sert qu'au premier démarrage ; le jeton de l'agent est ensuite gardé dans le volume /data.
+services:
+  reencodearr-agent:
+    image: ghcr.io/romain350/reencodearr-agent:latest
+    container_name: reencodearr-agent
+    restart: unless-stopped
+    environment:
+      HUB_URL: "http://IP-DU-HUB:8095"
+      ENROLL_CODE: "code-a-usage-unique"
+      AGENT_NAME: "gpu-docker"                 # nom affiché dans l'onglet Hosts
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
+    volumes:
+      - ./agent-data:/data                     # jeton de l'agent et fichiers en cours d'encodage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]

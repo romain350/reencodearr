@@ -1,0 +1,19 @@
+# Compose de l'app TrueNAS « reencodearr », tel que le genere deploy/truenas_create_app.py.
+# Les valeurs <...> viennent de /root/reencodearr.env (voir nas.env.example) ; le vrai mot de passe est dans REENCODEARR_CRED.
+services:
+  reencodearr:
+    container_name: reencodearr
+    image: ghcr.io/romain350/reencodearr:<version>
+    pull_policy: missing
+    restart: unless-stopped
+    user: "<REENCODEARR_USER, defaut 3000:0>"
+    ports:
+      - "<REENCODEARR_PORT, defaut 8095>:8095"
+    environment:
+      PUBLIC_URL: "<REENCODEARR_PUBLIC_URL>"
+      ADMIN_USER: "admin"
+      ADMIN_PASSWORD: "<voir REENCODEARR_CRED>"
+    volumes:
+      - "<REENCODEARR_SERIES>:/series"
+      - "<REENCODEARR_MOVIES>:/movies"     # seulement si le dossier existe
+      - "<REENCODEARR_BASE>/data:/data"

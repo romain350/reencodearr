@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reencodearr</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e50914'/%3E%3Cpath d='M11 8l14 8-14 8z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="loginForm" class="login-card">
+    <div class="logo">▶ Reencodearr</div>
+    <label>Utilisateur<input id="lUser" autocomplete="username" required></label>
+    <label>Mot de passe<input id="lPass" type="password" autocomplete="current-password" required></label>
+    <div id="lErr" class="err"></div>
+    <button class="btn primary" type="submit">Se connecter</button>
+  </form>
+</div>
+
+<div id="setup" class="login setup" hidden>
+  <form id="setupForm" class="login-card setup-card" novalidate>
+    <div class="logo">▶ Reencodearr</div>
+    <ol id="setupSteps" class="steps"></ol>
+    <div id="setupBody"></div>
+    <div id="setupErr" class="err"></div>
+    <div class="setup-actions">
+      <button class="btn" type="button" id="setupBack">Retour</button>
+      <div class="grow"></div>
+      <button class="btn" type="button" id="setupSkip">Passer</button>
+      <button class="btn primary" type="submit" id="setupNext">Suivant</button>
+    </div>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="logo">▶ Reencodearr</div>
+    <nav id="tabs">
+      <button data-tab="movies" class="on">Films</button>
+      <button data-tab="series">Séries</button>
+      <button data-tab="queue">File d'attente <span id="qCount" class="pill"></span></button>
+      <button data-tab="hosts">Hosts</button>
+      <button data-tab="stats">Statistiques</button>
+      <button data-tab="logs">Journal</button>
+      <button data-tab="settings">Paramètres</button>
+    </nav>
+    <div class="grow"></div>
+    <span id="who" class="muted"></span>
+    <span id="ver" class="ver"></span>
+    <button class="btn small" id="logout">Déconnexion</button>
+  </header>
+
+  <main>
+    <section id="tab-library">
+      <div class="toolbar">
+        <input id="search" placeholder="Rechercher une série…" type="search">
+        <label class="sort">Trier par
+          <select id="sortKey">
+            <option value="name">Nom</option>
+            <option value="size">Poids total</option>
+            <option value="episodes" data-kind="series">Nombre d'épisodes</option>
+            <option value="avg" data-kind="series">Poids moyen par épisode</option>
+            <option value="height" data-kind="movie">Résolution</option>
+            <option value="duration" data-kind="movie">Durée</option>
+            <option value="todo_size">Reste à encoder (poids)</option>
+            <option value="todo" data-kind="series">Reste à encoder (épisodes)</option>
+            <option value="hevc_pct">Avancement HEVC (%)</option>
+            <option value="hevc" data-kind="series">Épisodes déjà en HEVC</option>
+            <option value="bad" data-series="Épisodes défectueux" data-movie="Fichiers défectueux">Épisodes défectueux</option>
+            <option value="activity">Activité en cours</option>
+            <option value="selected" data-series="Sélectionnées d'abord" data-movie="Sélectionnés d'abord">Sélectionnées d'abord</option>
+          </select></label>
+        <button class="btn small" id="sortDir" title="Inverser l'ordre">↓</button>
+        <button class="btn small" id="selAll">Tout sélectionner</button>
+        <button class="btn small" id="selNone">Aucun</button>
+        <div class="grow"></div>
+        <span id="libInfo" class="muted"></span>
+      </div>
+      <div id="grid" class="grid"></div>
+      <div id="empty" class="empty" hidden></div>
+      <div id="selbar" class="selbar" hidden>
+        <b id="selCount"></b>
+        <button class="btn small" data-act="scan" title="Cherche les fichiers défectueux">Scanner</button>
+        <button class="btn small primary" data-act="encode">Encoder en HEVC</button>
+        <button class="btn small" data-act="cancel">Annuler les encodages</button>
+        <button class="btn small" data-act="unmonitor">Arrêter le suivi Sonarr</button>
+        <button class="btn small danger" data-act="delete_bad">Supprimer les défectueux</button>
+        <div class="grow"></div>
+        <button class="btn small" id="selNone2">Désélectionner</button>
+      </div>
+    </section>
+
+    <section id="tab-queue" hidden>
+      <div class="toolbar">
+        <button class="btn" id="pauseBtn">Mettre en pause</button>
+        <span id="queueInfo" class="muted"></span>
+      </div>
+      <table class="tbl" id="queueTbl"></table>
+    </section>
+
+    <section id="tab-hosts" hidden>
+      <div class="toolbar">
+        <button class="btn primary" id="addHost">Ajouter un host</button>
+        <span class="muted">Chaque host (Linux ou Windows, GPU NVIDIA) télécharge l'épisode ou le film, l'encode sur ses GPU, puis le renvoie au hub.</span>
+      </div>
+      <div id="hostList" class="hosts"></div>
+    </section>
+
+    <section id="tab-logs" hidden>
+      <div class="toolbar">
+        <select id="logLevel"><option value="">Tous les niveaux</option><option value="warn">Avertissements et erreurs</option><option value="error">Erreurs seulement</option></select>
+        <select id="logSource"><option value="">Toutes les sources</option></select>
+        <input id="logSearch" type="search" placeholder="Filtrer le texte…">
+        <label class="sort"><input type="checkbox" id="logLive" checked> Temps réel</label>
+        <div class="grow"></div>
+        <button class="btn small" id="logExport">Exporter (.txt)</button>
+        <button class="btn small danger" id="logClear">Vider le journal</button>
+      </div>
+      <table class="tbl" id="logTbl"></table>
+      <p class="hint" id="logInfo"></p>
+    </section>
+
+    <section id="tab-stats" hidden>
+      <div id="statsBody" class="settings"></div>
+    </section>
+
+    <section id="tab-settings" hidden>
+      <div id="settingsForm" class="settings"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="dlg"><div id="dlgBody"></div><div class="dlg-actions" id="dlgActions"></div></dialog>
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

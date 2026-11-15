@@ -1,0 +1,125 @@
+# Construit et publie les images sur GitHub Container Registry (ghcr.io).
+#   - push sur main : tags <version> (app/config.py ou agent/docker/VERSION), latest et sha-<commit>
+#   - tag Git v1.7.0 (hub) ou agent-v1.0.2 (agent) : tag <version> de l'image concernee
+#   - lancement manuel (onglet Actions -> Images Docker -> Run workflow) : construit et publie les deux images,
+#     puis cree la release GitHub v<version> du hub si elle n'existe pas encore (case cochee par defaut)
+name: Images Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*', 'agent-v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Creer aussi la release GitHub v<version> (version lue dans app/config.py)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: reencodearr
+            context: .
+            tag_prefix: v
+          - image: reencodearr-agent
+            context: agent/docker
+            tag_prefix: agent-v
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version et nom de l'image
+        id: v
+        run: |
+          if [ "${{ matrix.image }}" = reencodearr ]; then
+            version=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" app/config.py)
+          else
+            version=$(tr -d ' \n' < agent/docker/VERSION)
+          fi
+          [ -n "$version" ] || { echo "version introuvable"; exit 1; }
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/$owner/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+          # un tag Git ne publie que l'image qu'il vise (v* = hub, agent-v* = agent)
+          build=true
+          case "$GITHUB_REF" in
+            refs/tags/agent-v*) [ "${{ matrix.image }}" = reencodearr-agent ] || build=false ;;
+            refs/tags/v*)       [ "${{ matrix.image }}" = reencodearr ] || build=false ;;
+          esac
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Tags
+        id: meta
+        if: steps.v.outputs.build == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.v.outputs.name }}
+          tags: |
+            type=raw,value=${{ steps.v.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,enable={{is_default_branch}}
+            type=match,pattern=^${{ matrix.tag_prefix }}(.*),group=1
+          labels: |
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.v.outputs.build == 'true'
+
+      - name: Connexion a ghcr.io
+        if: steps.v.outputs.build == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (et push hors pull request)
+        if: steps.v.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  release:
+    name: Release GitHub
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Creer la release v<version> si elle n'existe pas
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          hub=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" app/config.py)
+          agent=$(tr -d ' \n' < agent/docker/VERSION)
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          if gh release view "v$hub" >/dev/null 2>&1; then
+            echo "La release v$hub existe deja : rien a faire."; exit 0
+          fi
+          printf '%s\n' \
+            "Images Docker :" "" \
+            "- hub : \`ghcr.io/$owner/reencodearr:$hub\` (et \`latest\`)" \
+            "- agent : \`ghcr.io/$owner/reencodearr-agent:$agent\` (et \`latest\`)" "" \
+            "Installation : voir le README." > notes.md
+          gh release create "v$hub" --target "$GITHUB_SHA" --title "Reencodearr $hub" --notes-file notes.md

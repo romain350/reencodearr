@@ -1,0 +1,17 @@
+# Reencodearr - exemple. Copiez .env.example en .env et adaptez les chemins, PUID/PGID et PUBLIC_URL.
+services:
+  reencodearr:
+    image: ghcr.io/romain350/reencodearr:latest   # publiee par GitHub Actions (onglet Packages du depot)
+    container_name: reencodearr
+    restart: unless-stopped
+    user: "${PUID:-3000}:${PGID:-0}"        # doit pouvoir ecrire dans la bibliotheque
+    ports:
+      - "8095:8095"
+    environment:
+      PUBLIC_URL: "${PUBLIC_URL:-http://localhost:8095}"   # adresse que les agents utilisent pour joindre le hub
+      ADMIN_USER: "${ADMIN_USER:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"  # vide : le compte est cree par l'assistant au 1er acces a l'interface
+    volumes:
+      - "${SERIES_PATH:-./series}:/series"                          # une sous-dossier = une serie
+      - "${MOVIES_PATH:-./movies}:/movies"                          # un sous-dossier (ou un fichier) = un film ; facultatif
+      - "${DATA_PATH:-./data}:/data"                              # base, affiches, fichiers encodes en transit

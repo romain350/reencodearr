@@ -1,0 +1,16 @@
+# Compose de l'app TrueNAS « reencodearr-agent », tel que le genere deploy/truenas_agent_app.py.
+# Les valeurs <...> viennent de /root/reencodearr.env (voir nas.env.example). Le jeton de l'agent vit dans /data/config.json.
+services:
+  reencodearr-agent:
+    container_name: reencodearr-agent
+    image: ghcr.io/romain350/reencodearr-agent:<version>
+    pull_policy: missing
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      HUB_URL: "<REENCODEARR_HUB_URL, defaut REENCODEARR_PUBLIC_URL>"
+      AGENT_NAME: "<REENCODEARR_AGENT_NAME, defaut nas-gpu>"
+      NVIDIA_VISIBLE_DEVICES: "<UUID du premier GPU, lu par nvidia-smi>"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
+    volumes:
+      - "<REENCODEARR_AGENT_BASE>/data:/data"
