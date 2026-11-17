@@ -1,5 +1,4 @@
 """Reencodearr : API, interface web et point d'entree des agents."""
-import hashlib
 import json
 import os
 import re
@@ -11,6 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from . import agents, backup, config, db, jobs, journal, library, posters, radarr, security, sonarr
 
@@ -57,6 +57,33 @@ async def lifespan(app):
 app = FastAPI(title='Reencodearr', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+_SECURITY_HEADERS = ((b'x-frame-options', b'DENY'), (b'x-content-type-options', b'nosniff'),
+                     (b'referrer-policy', b'same-origin'))
+
+
+class SecurityHeaders:
+    """L'interface ne doit pas pouvoir etre affichee dans le cadre d'un autre site (clics pieges) ni ses reponses
+    interpretees avec un autre type que celui annonce. Middleware ASGI pur : les envois des agents (plusieurs Go)
+    passent sans etre mis en memoire."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.inner(scope, receive, send)
+
+        async def send_with_headers(msg):
+            if msg['type'] == 'http.response.start':
+                have = {k.lower() for k, _ in msg.get('headers', [])}
+                msg = dict(msg, headers=list(msg.get('headers', [])) + [h for h in _SECURITY_HEADERS if h[0] not in have])
+            await send(msg)
+        await self.inner(scope, receive, send_with_headers)
+
+
+app.add_middleware(SecurityHeaders)
+
+
 # ------------------------------------------------------------------ dependances
 def ui(request: Request):
     if request.method not in ('GET', 'HEAD') and request.headers.get('x-requested-with') != 'reencode':
@@ -88,6 +115,8 @@ async def login(request: Request, response: Response):
     if request.headers.get('x-requested-with') != 'reencode':
         raise HTTPException(403)
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, 'corps invalide')
     ip = request.client.host if request.client else '?'
     token, err = security.login(str(body.get('username', '')), str(body.get('password', '')), ip)
     if err == 'trop':
@@ -320,6 +349,14 @@ def posters_test(user=Depends(ui)):
 async def actions(request: Request, user=Depends(ui)):
     """Corps : {action, series: [noms]} ; avec kind='movie', les noms sont des films (onglet Films)."""
     b = await request.json()
+    if not isinstance(b, dict) or not isinstance(b.get('series', []), list):
+        raise HTTPException(400, 'corps invalide')
+    # hors de la boucle d'evenements : la mise en file relit la bibliotheque et lance ffprobe, ce qui pouvait
+    # figer tout le hub (interface et agents) pendant de longues secondes
+    return await run_in_threadpool(_action, b, user)
+
+
+def _action(b, user):
     movie = b.get('kind') == 'movie'
     act, shown = b.get('action'), [str(n) for n in b.get('series', [])]
     keys = [library.movie_key(n) for n in shown] if movie else shown
@@ -413,8 +450,12 @@ async def queue(user=Depends(ui)):
 @app.get('/api/logs')
 async def get_logs(request: Request, user=Depends(ui)):
     q = request.query_params
-    return {'logs': journal.query(limit=q.get('limit', 300), level=q.get('level'), source=q.get('source') or None,
-                                  text=q.get('q') or None, before=q.get('before') or None),
+    try:
+        limit, before = int(q.get('limit') or 300), int(q['before']) if q.get('before') else None
+    except ValueError:
+        raise HTTPException(400, 'limit / before : nombre attendu')
+    return {'logs': journal.query(limit=limit, level=q.get('level'), source=q.get('source') or None,
+                                  text=q.get('q') or None, before=before),
             'sources': [r['source'] for r in db.q('SELECT DISTINCT source FROM logs ORDER BY source')]}
 
 
@@ -1069,26 +1110,37 @@ async def agent_source(job_id: int, request: Request, host=Depends(agent)):
 @app.post('/api/agent/jobs/{job_id}/progress')
 async def agent_progress(job_id: int, request: Request, host=Depends(agent)):
     b = await request.json()
-    cancel = jobs.progress(job_id, host['id'], float(b.get('progress', 0)), str(b.get('phase', '')),
-                           str(b.get('speed', '')), _token(request))
+    try:
+        pct = max(0.0, min(100.0, float(b.get('progress') or 0)))
+    except (TypeError, ValueError):
+        pct = 0.0
+    cancel = jobs.progress(job_id, host['id'], pct, str(b.get('phase', ''))[:20],
+                           str(b.get('speed', ''))[:20], _token(request))
     return {'cancel': cancel}
 
 
 @app.put('/api/agent/jobs/{job_id}/result')
 async def agent_result(job_id: int, request: Request, host=Depends(agent)):
     _own_job(job_id, host, request)
-    part = jobs.staging_path(job_id, part=True)
+    part = jobs.upload_part(job_id)
+    expected = request.headers.get('content-length')
+    received = 0
     try:
         with open(part, 'wb') as f:
             async for chunk in request.stream():
                 f.write(chunk)
+                received += len(chunk)
+        if expected and expected.isdigit() and received != int(expected):
+            raise IOError('%d octets recus sur %s' % (received, expected))
     except Exception:
         jobs._rm(part)
         raise HTTPException(400, 'envoi interrompu')
-    os.replace(part, jobs.staging_path(job_id))
+    # le bail a pu expirer pendant un long envoi et le job etre repris ailleurs : on reverifie avant d'accepter
+    if not jobs.accept_upload(job_id, host['id'], _token(request), part):
+        journal.warn('queue', 'job %d : resultat de %s refuse, le job ne lui appartient plus' % (job_id, host['name']))
+        raise HTTPException(409, 'job non attribue a cet hote')
     journal.info('queue', 'job %d : fichier encode recu de %s (%.2f Go), verification en cours' % (
-        job_id, host['name'], os.path.getsize(jobs.staging_path(job_id)) / 1e9))
-    jobs.submit_upload(job_id)
+        job_id, host['name'], received / 1e9))
     return {'status': 'verifying'}
 
 

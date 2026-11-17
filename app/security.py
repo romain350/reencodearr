@@ -63,8 +63,9 @@ def create_first_admin(user, password):
 
 def too_many_failures(ip):
     now = time.time()
-    _fails[ip] = [t for t in _fails.get(ip, []) if now - t < 300]
-    return len(_fails[ip]) >= 5
+    for k in [k for k, v in _fails.items() if not v or now - v[-1] >= 300]:   # la table ne grossit pas sans fin
+        _fails.pop(k, None)
+    return len([t for t in _fails.get(ip, []) if now - t < 300]) >= 5
 
 
 def login(username, password, ip):
@@ -80,6 +81,7 @@ def login(username, password, ip):
 
 def open_session(username):
     token = secrets.token_urlsafe(32)
+    db.run('DELETE FROM sessions WHERE expires<?', (time.time(),))      # menage des sessions expirees
     db.run('INSERT INTO sessions(token_hash,username,expires) VALUES(?,?,?)',
            (sha(token), username, time.time() + SESSION_TTL))
     return token
@@ -116,6 +118,8 @@ def new_enroll_code(reusable=False):
     reinstalle a chaque demarrage) : premiere utilisation sous 7 jours, puis sans limite ; il reste rattache au host
     qu'il a cree, et retirer ce host le revoque."""
     code = secrets.token_urlsafe(18 if not reusable else 24)
+    # menage : codes ordinaires utilises ou expires, cles reutilisables jamais servies et expirees
+    db.run('DELETE FROM enroll_codes WHERE host_id IS NULL AND (used=1 OR expires<?)', (time.time() - 86400,))
     db.run('INSERT INTO enroll_codes(code_hash,expires,reusable) VALUES(?,?,?)',
            (sha(code), time.time() + (REUSABLE_FIRST_USE if reusable else 3600), 1 if reusable else 0))
     return code

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -38,8 +39,10 @@ def cached(folder):
 def store(folder, data):
     base = os.path.join(config.POSTER_DIR, cache_key(folder))
     if data:
-        with open(base + '.jpg', 'wb') as f:
+        tmp = '%s.%d.tmp' % (base, threading.get_ident())     # deux affichages simultanes : jamais d'image a moitie ecrite
+        with open(tmp, 'wb') as f:
             f.write(data)
+        os.replace(tmp, base + '.jpg')
         if os.path.exists(base + '.none'):
             os.remove(base + '.none')
         return base + '.jpg'

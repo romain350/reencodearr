@@ -213,11 +213,13 @@ def scan_episode(rel, level):
 def enqueue_scan(series_names, level):
     n = 0
     with _scan_lock:
+        queued = set(scan_queue)        # liste parcourue une fois : rester rapide sur une grosse bibliotheque
         for name in series_names:
             added = 0
             for r in db.q('SELECT path FROM episodes WHERE series=?', (name,)):
-                if r['path'] not in scan_queue:
+                if r['path'] not in queued:
                     scan_queue.append(r['path'])
+                    queued.add(r['path'])
                     added += 1
             if added:
                 prev = scan_progress.get(name) or [0, 0]
