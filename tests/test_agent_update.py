@@ -131,9 +131,11 @@ def main():
     with open(os.path.join(ROOT, 'agent', 'agent.py')) as f:
         open(recent, 'w').write(f.read().replace("VERSION = '%s'" % latest, "VERSION = '1.3.9'"))
     old = os.path.join(TMP, 'old.py')
-    with open(old, 'wb') as f:      # agent 1.3.1, avant ce changement
-        f.write(subprocess.run(['git', 'show', '9ef3cb5:agent/agent.py'], cwd=ROOT, capture_output=True,
-                               check=True).stdout)
+    with open(os.path.join(ROOT, 'agent', 'agent.py')) as f:
+        # agent 1.3.x simule : il ne sait pas se mettre a jour seul (pas de self_update) et s'arrete sur un 401.
+        # (l'ancien test lisait l'agent 1.3.1 dans un commit qui n'existe plus depuis la reecriture de l'historique)
+        code = f.read().replace("VERSION = '%s'" % latest, "VERSION = '1.3.1'")
+        open(old, 'w').write(code.replace("'self_update': True", "'self_update': False"))
     paths = {'recent': enroll('recent', recent, 'self'), 'docker': enroll('docker', old, 'docker'),
              'systemd': enroll('systemd', old, 'systemd')}
     assert wait(lambda: all((host(n) or {}).get('online') for n in paths)), 'trois agents en ligne'
