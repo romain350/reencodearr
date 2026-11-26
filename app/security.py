@@ -4,12 +4,16 @@ import hmac
 import os
 import re
 import secrets
+import threading
 import time
 
 from . import db
 
 SESSION_TTL = 7 * 86400
+MAX_PASSWORD = 1024       # au-dela, scrypt ne sert qu'a occuper le serveur
 _fails = {}          # ip -> horodatages des échecs récents
+_fails_lock = threading.Lock()
+_dummy = []          # empreinte factice, calculee une fois (voir login)
 
 
 def hash_password(pw, salt=None):
@@ -53,6 +57,8 @@ def create_first_admin(user, password):
         return "nom d'utilisateur invalide (lettres, chiffres, . _ @ -, 40 caracteres maximum)"
     if len(password or '') < 8:
         return 'mot de passe trop court (8 caracteres minimum)'
+    if len(password) > MAX_PASSWORD:
+        return 'mot de passe trop long (%d caracteres maximum)' % MAX_PASSWORD
     with db.tx() as c:
         if c.execute('SELECT 1 FROM users').fetchone():
             return 'un compte administrateur existe deja'
@@ -63,18 +69,24 @@ def create_first_admin(user, password):
 
 def too_many_failures(ip):
     now = time.time()
-    for k in [k for k, v in _fails.items() if not v or now - v[-1] >= 300]:   # la table ne grossit pas sans fin
-        _fails.pop(k, None)
-    return len([t for t in _fails.get(ip, []) if now - t < 300]) >= 5
+    with _fails_lock:
+        for k in [k for k, v in _fails.items() if not v or now - v[-1] >= 300]:   # la table ne grossit pas sans fin
+            _fails.pop(k, None)
+        return len([t for t in _fails.get(ip, []) if now - t < 300]) >= 5
 
 
 def login(username, password, ip):
     if too_many_failures(ip):
         return None, 'trop'
     row = db.one('SELECT pw_hash FROM users WHERE username=?', (username,))
-    ok = check_password(password, row['pw_hash'] if row else hash_password('x'))
+    if not _dummy:
+        _dummy.append(hash_password(secrets.token_hex(8)))
+    # compte inconnu : meme travail (un seul scrypt) que pour un compte connu, le temps de reponse ne dit pas
+    # si le nom d'utilisateur existe
+    ok = len(password) <= MAX_PASSWORD and check_password(password, row['pw_hash'] if row else _dummy[0])
     if not row or not ok:
-        _fails.setdefault(ip, []).append(time.time())
+        with _fails_lock:
+            _fails.setdefault(ip, []).append(time.time())
         return None, 'refus'
     return open_session(username), None
 
@@ -103,7 +115,7 @@ def logout(token):
 
 def change_password(username, old, new):
     row = db.one('SELECT pw_hash FROM users WHERE username=?', (username,))
-    if not row or not check_password(old, row['pw_hash']) or len(new) < 8:
+    if not row or not 8 <= len(new) <= MAX_PASSWORD or len(old) > MAX_PASSWORD or not check_password(old, row['pw_hash']):
         return False
     db.run('UPDATE users SET pw_hash=? WHERE username=?', (hash_password(new), username))
     db.run('DELETE FROM sessions WHERE username=?', (username,))
@@ -118,6 +130,8 @@ def new_enroll_code(reusable=False):
     reinstalle a chaque demarrage) : premiere utilisation sous 7 jours, puis sans limite ; il reste rattache au host
     qu'il a cree, et retirer ce host le revoque."""
     code = secrets.token_urlsafe(18 if not reusable else 24)
+    while code[0] in '-_':      # « agent.py register --code -abc » : un tiret en tete serait pris pour une option
+        code = secrets.token_urlsafe(18 if not reusable else 24)
     # menage : codes ordinaires utilises ou expires, cles reutilisables jamais servies et expirees
     db.run('DELETE FROM enroll_codes WHERE host_id IS NULL AND (used=1 OR expires<?)', (time.time() - 86400,))
     db.run('INSERT INTO enroll_codes(code_hash,expires,reusable) VALUES(?,?,?)',

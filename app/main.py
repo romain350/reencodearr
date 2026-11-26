@@ -57,8 +57,13 @@ async def lifespan(app):
 app = FastAPI(title='Reencodearr', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+# Politique de contenu : l'interface ne charge que ses propres fichiers. Un texte venu d'ailleurs (nom de fichier,
+# reponse d'un agent) qui echapperait a l'echappement ne peut ni executer de script ni envoyer de donnees dehors.
+_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 _SECURITY_HEADERS = ((b'x-frame-options', b'DENY'), (b'x-content-type-options', b'nosniff'),
-                     (b'referrer-policy', b'same-origin'))
+                     (b'referrer-policy', b'same-origin'), (b'content-security-policy', _CSP.encode()))
+_NO_STORE = (b'cache-control', b'no-store')     # reponses de l'API (reglages, export avec cles...) : jamais en cache
 
 
 class SecurityHeaders:
@@ -73,10 +78,12 @@ class SecurityHeaders:
         if scope['type'] != 'http':
             return await self.inner(scope, receive, send)
 
+        extra = _SECURITY_HEADERS + ((_NO_STORE,) if scope['path'].startswith('/api/') else ())
+
         async def send_with_headers(msg):
             if msg['type'] == 'http.response.start':
                 have = {k.lower() for k, _ in msg.get('headers', [])}
-                msg = dict(msg, headers=list(msg.get('headers', [])) + [h for h in _SECURITY_HEADERS if h[0] not in have])
+                msg = dict(msg, headers=list(msg.get('headers', [])) + [h for h in extra if h[0] not in have])
             await send(msg)
         await self.inner(scope, receive, send_with_headers)
 
@@ -105,6 +112,57 @@ def agent(request: Request):
     return row
 
 
+MAX_JSON = 2 << 20      # aucun corps JSON legitime (reglages, fichier de configuration importe) n'approche 2 Mo
+
+
+async def _json(request, strict=True):
+    """Corps JSON d'une requete : toujours un objet, de taille bornee (les routes ouvertes sans connexion ne doivent
+    pas pouvoir remplir la memoire du hub). strict=False : un corps absent ou invalide vaut {}."""
+    size = request.headers.get('content-length')
+    if size and size.isdigit() and int(size) > MAX_JSON:
+        raise HTTPException(413, 'corps trop volumineux')
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_JSON:
+            raise HTTPException(413, 'corps trop volumineux')
+    try:
+        b = json.loads(bytes(raw))
+    except ValueError:
+        b = None
+    if not isinstance(b, dict):
+        if strict:
+            raise HTTPException(400, 'corps invalide')
+        return {}
+    return b
+
+
+def _int(v):
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clean_info(info):
+    """Etat envoye par un agent (GPU, version, ffmpeg) : types et longueurs imposes avant de l'enregistrer et de
+    l'afficher. Un agent n'est pas l'administrateur : ce qu'il envoie ne doit pas pouvoir toucher l'interface."""
+    if not isinstance(info, dict):
+        return {}
+    out = {}
+    if isinstance(info.get('gpus'), list):
+        out['gpus'] = [{'id': str(g['id'])[:16], 'name': str(g.get('name') or '')[:80],
+                        'mem_total': _int(g.get('mem_total')), 'mem_used': _int(g.get('mem_used'))}
+                       for g in info['gpus'][:64] if isinstance(g, dict) and g.get('id') is not None]
+    for k, n in (('platform', 80), ('version', 20), ('ffmpeg', 260), ('nvenc_error', 200)):
+        if info.get(k) is not None:
+            out[k] = str(info[k])[:n]
+    for k in ('nvenc', 'self_update'):
+        if isinstance(info.get(k), bool):
+            out[k] = info[k]
+    return out
+
+
 def base_url(request):
     return (db.get_settings()['public_url'] or config.PUBLIC_URL or str(request.base_url)).rstrip('/')
 
@@ -114,11 +172,11 @@ def base_url(request):
 async def login(request: Request, response: Response):
     if request.headers.get('x-requested-with') != 'reencode':
         raise HTTPException(403)
-    body = await request.json()
-    if not isinstance(body, dict):
-        raise HTTPException(400, 'corps invalide')
+    body = await _json(request)
     ip = request.client.host if request.client else '?'
-    token, err = security.login(str(body.get('username', '')), str(body.get('password', '')), ip)
+    # scrypt occupe le processeur un instant : hors de la boucle d'evenements, pour ne pas figer agents et interface
+    token, err = await run_in_threadpool(security.login, str(body.get('username', ''))[:200],
+                                         str(body.get('password', '')), ip)
     if err == 'trop':
         journal.warn('auth', 'connexion bloquee (trop d echecs) depuis %s' % ip)
         raise HTTPException(429, 'trop de tentatives, reessayez dans quelques minutes')
@@ -138,7 +196,7 @@ def _set_session_cookie(request, response, token):
 
 # ------------------------------------------------------------------ assistant de premier lancement
 @app.get('/api/setup')
-async def setup_state():
+def setup_state():
     """Public : indique a l'interface s'il faut afficher l'assistant (et s'il faut creer le compte admin)."""
     admin_needed = not security.has_users()
     return {'admin_needed': admin_needed, 'done': not admin_needed and db.get_settings()['setup_done'],
@@ -150,9 +208,9 @@ async def setup_admin(request: Request, response: Response):
     """Public, mais seulement tant qu'aucun compte n'existe : cree l'admin puis ouvre sa session."""
     if request.headers.get('x-requested-with') != 'reencode':
         raise HTTPException(403)
-    b = await request.json()
+    b = await _json(request)
     user, pw = str(b.get('username', '')).strip(), str(b.get('password', ''))
-    err = security.create_first_admin(user, pw)
+    err = await run_in_threadpool(security.create_first_admin, user, pw)
     if err:
         raise HTTPException(409 if 'existe' in err else 400, err)
     ip = request.client.host if request.client else '?'
@@ -162,36 +220,36 @@ async def setup_admin(request: Request, response: Response):
 
 
 @app.post('/api/setup/finish')
-async def setup_finish(user=Depends(ui)):
+def setup_finish(user=Depends(ui)):
     db.set_settings({'setup_done': True})
     journal.info('system', '%s termine l assistant de premier lancement' % user)
     return {'ok': True}
 
 
 @app.post('/api/setup/restart')
-async def setup_restart(user=Depends(ui)):
+def setup_restart(user=Depends(ui)):
     db.set_settings({'setup_done': False})
     journal.info('system', '%s relance l assistant de premier lancement' % user)
     return {'ok': True}
 
 
 @app.post('/api/logout')
-async def logout(request: Request, response: Response, user=Depends(ui)):
+def logout(request: Request, response: Response, user=Depends(ui)):
     security.logout(request.cookies.get(COOKIE))
     response.delete_cookie(COOKIE, path='/')
     return {'ok': True}
 
 
 @app.get('/api/me')
-async def me(user=Depends(ui)):
+def me(user=Depends(ui)):
     return {'user': user, 'version': config.VERSION}
 
 
 @app.post('/api/password')
 async def password(request: Request, user=Depends(ui)):
-    b = await request.json()
+    b = await _json(request)
     journal.info('auth', '%s change son mot de passe' % user)
-    if not security.change_password(user, str(b.get('old', '')), str(b.get('new', ''))):
+    if not await run_in_threadpool(security.change_password, user, str(b.get('old', '')), str(b.get('new', ''))):
         raise HTTPException(400, 'ancien mot de passe incorrect ou nouveau trop court (8 caracteres minimum)')
     return {'ok': True}
 
@@ -220,15 +278,17 @@ def _group_rows(movies=False):
         jobs_by.setdefault(r['series'], {})[r['status']] = r['c']
     main_file = {}
     if movies:      # le plus gros fichier d'un film est le film lui-meme (les autres : bonus, extraits...)
-        for e in db.q('SELECT series, codec, probe, size FROM episodes %s ORDER BY size' % where, (MOVIE_LIKE,)):
+        # MAX(size) : SQLite donne alors les autres colonnes de cette meme ligne ; un seul sondage a relire par film
+        for e in db.q('SELECT series, codec, probe, MAX(size) FROM episodes %s GROUP BY series' % where, (MOVIE_LIKE,)):
             p = json.loads(e['probe']) if e['probe'] else {}
             main_file[e['series']] = {'codec': e['codec'] or '', 'height': p.get('height'), 'duration': p.get('duration')}
     out = []
+    with library._scan_lock:
+        scans = {k: list(v) for k, v in library.scan_progress.items()}
     for r in rows:
         js = jobs_by.get(r['series'], {})
         total = sum(v for k, v in js.items() if k != 'canceled')
-        with library._scan_lock:
-            sc = list(library.scan_progress.get(r['series']) or [])
+        sc = scans.get(r['series'])
         row = {'name': library.display(r['series']), 'episodes': r['n'], 'size': r['size'] or 0, 'hevc': r['hevc'] or 0,
                'pending_probe': r['pending'] or 0, 'bad': r['bad'] or 0,
                'todo': r['todo'] or 0, 'todo_size': r['todo_size'] or 0,
@@ -247,19 +307,19 @@ def _queued():
 
 
 @app.get('/api/status')
-async def status(user=Depends(ui)):
+def status(user=Depends(ui)):
     """Etat leger pour l'en-tete (compteur de la file), interroge toutes les 3 s."""
     return {'queued': _queued(), 'paused': db.get_settings()['paused']}
 
 
 @app.get('/api/series')
-async def series(user=Depends(ui)):
+def series(user=Depends(ui)):
     s = db.get_settings()
     return {'series': _group_rows(), 'paused': s['paused'], 'sonarr': sonarr.configured(), 'queued': _queued()}
 
 
 @app.get('/api/movies')
-async def movies(user=Depends(ui)):
+def movies(user=Depends(ui)):
     s = db.get_settings()
     return {'movies': _group_rows(movies=True), 'paused': s['paused'], 'radarr': radarr.configured(), 'queued': _queued(),
             'dir_ok': os.path.isdir(config.MOVIES_DIR)}
@@ -282,12 +342,12 @@ def _files(key):
 
 
 @app.get('/api/series/{name}/episodes')
-async def episodes(name: str, user=Depends(ui)):
+def episodes(name: str, user=Depends(ui)):
     return {'episodes': _files(name)}
 
 
 @app.get('/api/movies/{name}/files')
-async def movie_files(name: str, user=Depends(ui)):
+def movie_files(name: str, user=Depends(ui)):
     return {'files': _files(library.movie_key(name))}
 
 
@@ -348,8 +408,8 @@ def posters_test(user=Depends(ui)):
 @app.post('/api/actions')
 async def actions(request: Request, user=Depends(ui)):
     """Corps : {action, series: [noms]} ; avec kind='movie', les noms sont des films (onglet Films)."""
-    b = await request.json()
-    if not isinstance(b, dict) or not isinstance(b.get('series', []), list):
+    b = await _json(request)
+    if not isinstance(b.get('series', []), list):
         raise HTTPException(400, 'corps invalide')
     # hors de la boucle d'evenements : la mise en file relit la bibliotheque et lance ffprobe, ce qui pouvait
     # figer tout le hub (interface et agents) pendant de longues secondes
@@ -434,7 +494,7 @@ def _action(b, user):
 
 # ------------------------------------------------------------------ file d'attente
 @app.get('/api/queue')
-async def queue(user=Depends(ui)):
+def queue(user=Depends(ui)):
     names = {h['id']: h['name'] for h in db.q('SELECT id,name FROM hosts')}
     rows = db.q("SELECT * FROM jobs WHERE status IN ('queued','claimed','encoding','uploading','verifying') "
                 "ORDER BY batch,id LIMIT 500")
@@ -448,7 +508,7 @@ async def queue(user=Depends(ui)):
 
 
 @app.get('/api/logs')
-async def get_logs(request: Request, user=Depends(ui)):
+def get_logs(request: Request, user=Depends(ui)):
     q = request.query_params
     try:
         limit, before = int(q.get('limit') or 300), int(q['before']) if q.get('before') else None
@@ -460,7 +520,7 @@ async def get_logs(request: Request, user=Depends(ui)):
 
 
 @app.delete('/api/logs')
-async def clear_logs(request: Request, user=Depends(ui)):
+def clear_logs(request: Request, user=Depends(ui)):
     if request.query_params.get('confirm') != 'yes':
         raise HTTPException(400, 'confirmation requise')
     n = journal.clear()
@@ -469,7 +529,7 @@ async def clear_logs(request: Request, user=Depends(ui)):
 
 
 @app.post('/api/jobs/{job_id}/cancel')
-async def job_cancel(job_id: int, user=Depends(ui)):
+def job_cancel(job_id: int, user=Depends(ui)):
     jobs.cancel_job(job_id)
     journal.info('queue', '%s annule le job %d' % (user, job_id))
     return {'ok': True}
@@ -477,10 +537,7 @@ async def job_cancel(job_id: int, user=Depends(ui)):
 
 @app.post('/api/jobs/{job_id}/prioritize')
 async def job_prioritize(job_id: int, request: Request, user=Depends(ui)):
-    try:
-        force = bool((await request.json()).get('force'))
-    except Exception:
-        force = False
+    force = bool((await _json(request, strict=False)).get('force'))
     r = jobs.prioritize_job(job_id, force=force)
     if not r['ok']:
         raise HTTPException(409, 'ce fichier n\'est plus en attente')
@@ -491,7 +548,7 @@ async def job_prioritize(job_id: int, request: Request, user=Depends(ui)):
 
 
 @app.post('/api/jobs/{job_id}/retry')
-async def job_retry(job_id: int, user=Depends(ui)):
+def job_retry(job_id: int, user=Depends(ui)):
     ok = jobs.retry_job(job_id)
     journal.info('queue', '%s relance le job %d : %s' % (user, job_id, 'remis en file' if ok else 'impossible'))
     return {'ok': ok}
@@ -499,7 +556,7 @@ async def job_retry(job_id: int, user=Depends(ui)):
 
 # ------------------------------------------------------------------ statistiques
 @app.get('/api/stats')
-async def stats(user=Depends(ui)):
+def stats(user=Depends(ui)):
     """Espace gagne par les encodages valides (jobs 'done' avec taille avant/apres)."""
     done = "status='done' AND src_size>0 AND out_size>0"
     t = db.q("SELECT COUNT(*) n, COALESCE(SUM(src_size),0) a, COALESCE(SUM(out_size),0) b, MIN(finished) first, "
@@ -545,7 +602,7 @@ def _mask(s):
 
 
 @app.get('/api/settings')
-async def get_settings(user=Depends(ui)):
+def get_settings(user=Depends(ui)):
     return {'settings': _mask(db.get_settings()), 'quarantine': jobs.quarantine_info()}
 
 
@@ -623,6 +680,8 @@ def _clean_settings(b):
         b['public_url'] = b['public_url'].strip().rstrip('/')
         if b['public_url'] and not re.match(r'https?://[^/\s]+', b['public_url']):
             raise HTTPException(400, "URL publique du hub : elle doit commencer par http:// ou https://")
+        if re.search(r'[\s\'"`$<>\\|;&(){}]', b['public_url']):   # elle est recopiee dans les scripts d'installation
+            raise HTTPException(400, "URL publique du hub : caractere non autorise")
     for k in ('sonarr', 'radarr'):
         u = (b.get(k) or {}).get('url')
         if u and not re.match(r'https?://[^/\s]+', u):
@@ -646,7 +705,7 @@ def _clean_settings(b):
 
 @app.put('/api/settings')
 async def put_settings(request: Request, user=Depends(ui)):
-    b = _clean_settings(await request.json())
+    b = _clean_settings(await _json(request))
     sonarr._cache['t'] = radarr._cache['t'] = 0
     db.set_settings(b)
     journal.info('action', '%s modifie les parametres : %s' % (user, ', '.join(sorted(b)) or '-'))
@@ -655,12 +714,12 @@ async def put_settings(request: Request, user=Depends(ui)):
 
 # ------------------------------------------------------------------ export / import de la configuration
 @app.get('/api/settings/sections')
-async def settings_sections(user=Depends(ui)):
+def settings_sections(user=Depends(ui)):
     return {'sections': backup.sections_info()}
 
 
 @app.get('/api/settings/export')
-async def settings_export(request: Request, user=Depends(ui)):
+def settings_export(request: Request, user=Depends(ui)):
     secs = [s for s in (request.query_params.get('sections') or '').split(',') if s] or None
     secrets = request.query_params.get('secrets') in ('1', 'true', 'yes')
     data = backup.export(secs, secrets)
@@ -675,9 +734,7 @@ async def settings_import(request: Request, user=Depends(ui)):
     """Corps : {data: <fichier exporte>, sections: [...] (facultatif), dry_run: bool}.
 
     Une cle API absente du fichier (export sans les cles) garde la valeur deja enregistree."""
-    b = await request.json()
-    if not isinstance(b, dict):
-        raise HTTPException(400, 'corps invalide')
+    b = await _json(request)
     try:
         parsed = backup.parse(b.get('data'))
     except ValueError as e:
@@ -703,7 +760,7 @@ async def settings_import(request: Request, user=Depends(ui)):
 
 
 @app.post('/api/settings/sonarr-test')
-async def sonarr_test(user=Depends(ui)):
+def sonarr_test(user=Depends(ui)):
     try:
         return {'ok': True, **sonarr.test()}
     except Exception as e:
@@ -712,7 +769,7 @@ async def sonarr_test(user=Depends(ui)):
 
 
 @app.post('/api/settings/radarr-test')
-async def radarr_test(user=Depends(ui)):
+def radarr_test(user=Depends(ui)):
     try:
         return {'ok': True, **radarr.test()}
     except Exception as e:
@@ -721,7 +778,7 @@ async def radarr_test(user=Depends(ui)):
 
 
 @app.delete('/api/quarantine')
-async def purge(request: Request, user=Depends(ui)):
+def purge(request: Request, user=Depends(ui)):
     if request.query_params.get('confirm') != 'yes':
         raise HTTPException(400, 'confirmation requise')
     info = jobs.purge_quarantine()
@@ -747,7 +804,7 @@ def _host_view(h, hub_url):
 
 
 @app.get('/api/hosts')
-async def hosts(request: Request, user=Depends(ui)):
+def hosts(request: Request, user=Depends(ui)):
     url = base_url(request)
     return {'hosts': [_host_view(h, url) for h in db.q('SELECT * FROM hosts ORDER BY name')],
             'agent_latest': agents.latest()}
@@ -757,11 +814,7 @@ async def hosts(request: Request, user=Depends(ui)):
 async def enroll(request: Request, user=Depends(ui)):
     """Commande d'installation d'un host. Corps facultatif : {"os": "linux" | "windows", "reusable": bool}.
     reusable : machine non persistante qui relance la commande a chaque demarrage et retrouve le meme host."""
-    try:
-        b = await request.json()
-    except Exception:
-        b = {}
-    b = b if isinstance(b, dict) else {}
+    b = await _json(request, strict=False)
     windows = b.get('os') == 'windows'
     reusable = bool(b.get('reusable'))
     code = security.new_enroll_code(reusable)
@@ -771,7 +824,7 @@ async def enroll(request: Request, user=Depends(ui)):
         'Windows' if windows else 'Linux'))
     if windows:
         command = ("powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm '%s/enroll/%s/windows' | iex\""
-                   % (url, code))
+                   % (_ps(url), code))
     else:
         command = "curl -fsSL %s | sudo bash" % shlex.quote('%s/enroll/%s' % (url, code))
     return {'command': command, 'expires_in': security.REUSABLE_FIRST_USE if reusable else 3600, 'url': url,
@@ -780,10 +833,12 @@ async def enroll(request: Request, user=Depends(ui)):
 
 @app.patch('/api/hosts/{host_id}')
 async def host_patch(host_id: int, request: Request, user=Depends(ui)):
-    b = await request.json()
+    b = await _json(request)
     h = db.one('SELECT * FROM hosts WHERE id=?', (host_id,))
     if not h:
         raise HTTPException(404)
+    if 'gpus_enabled' in b and not isinstance(b['gpus_enabled'], list):
+        raise HTTPException(400, 'gpus_enabled : liste attendue')
     if 'enabled' in b:
         db.run('UPDATE hosts SET enabled=? WHERE id=?', (1 if b['enabled'] else 0, host_id))
     if 'gpus_enabled' in b:
@@ -795,12 +850,13 @@ async def host_patch(host_id: int, request: Request, user=Depends(ui)):
             db.run('UPDATE hosts SET name=? WHERE id=?', (str(b['name'])[:60], host_id))
         except Exception:
             raise HTTPException(400, 'nom deja utilise')
-    journal.info('agent', '%s modifie le host %d : %s' % (user, host_id, json.dumps(b)))
+    journal.info('agent', '%s modifie le host %d : %s' % (user, host_id, json.dumps(
+        {k: b[k] for k in ('enabled', 'gpus_enabled', 'name') if k in b})[:300]))
     return {'ok': True}
 
 
 @app.post('/api/hosts/{host_id}/update')
-async def host_update(host_id: int, user=Depends(ui)):
+def host_update(host_id: int, user=Depends(ui)):
     h = db.one('SELECT * FROM hosts WHERE id=?', (host_id,))
     if not h:
         raise HTTPException(404)
@@ -810,7 +866,7 @@ async def host_update(host_id: int, user=Depends(ui)):
 
 
 @app.delete('/api/hosts/{host_id}')
-async def host_delete(host_id: int, user=Depends(ui)):
+def host_delete(host_id: int, user=Depends(ui)):
     for j in db.q("SELECT id FROM jobs WHERE host_id=? AND status IN ('claimed','encoding','uploading')", (host_id,)):
         jobs.fail(j['id'], host_id, 'hote supprime')
     db.run('DELETE FROM hosts WHERE id=?', (host_id,))
@@ -1024,7 +1080,7 @@ async def agent_file():
 
 @app.post('/api/agent/register')
 async def agent_register(request: Request):
-    b = await request.json()
+    b = await _json(request)
     code = str(b.get('code', ''))
     key = security.consume_code(code)
     if not key:
@@ -1035,7 +1091,7 @@ async def agent_register(request: Request):
         # processus ne peut plus rien faire, ses jobs repartent en file sans tentative perdue.
         token = security.new_host_token()
         info = json.loads(old['info'] or '{}')
-        info.update(b.get('info') or {})
+        info.update(_clean_info(b.get('info')))
         db.run('UPDATE hosts SET token_hash=?,info=?,last_seen=?,agent_update=NULL WHERE id=?',
                (security.sha(token), json.dumps(info), time.time(), old['id']))
         for j in db.q("SELECT id FROM jobs WHERE host_id=? AND status IN %s" % jobs.RUNNING_SQL, (old['id'],)):
@@ -1043,14 +1099,14 @@ async def agent_register(request: Request):
             jobs.fail(j['id'], old['id'], 'machine redemarree')
         journal.info('agent', '%s s est reenregistre (cle reutilisable)' % old['name'])
         return {'token': token, 'host_id': old['id'], 'name': old['name']}
-    name = str(b.get('name') or 'host')[:50]
+    name = re.sub(r'[\x00-\x1f\x7f]', '', str(b.get('name') or 'host'))[:50].strip() or 'host'
     base, i = name, 1
     while db.one('SELECT 1 FROM hosts WHERE name=?', (name,)):
         i += 1
         name = '%s-%d' % (base, i)
     token = security.new_host_token()
     hid = db.run('INSERT INTO hosts(name,token_hash,enabled,gpus_enabled,info,last_seen,created) VALUES(?,?,?,?,?,?,?)',
-                 (name, security.sha(token), 1, '[]', json.dumps(b.get('info') or {}), time.time(), time.time()))
+                 (name, security.sha(token), 1, '[]', json.dumps(_clean_info(b.get('info'))), time.time(), time.time()))
     if key['reusable']:
         security.bind_code(code, hid)
     journal.info('agent', 'nouveau host enregistre : %s (id %d)%s' % (name, hid, ' avec une cle reutilisable'
@@ -1060,8 +1116,8 @@ async def agent_register(request: Request):
 
 @app.post('/api/agent/heartbeat')
 async def agent_heartbeat(request: Request, host=Depends(agent)):
-    b = await request.json()
-    info = b.get('info') or {}
+    b = await _json(request)
+    info = _clean_info(b.get('info'))
     first = not json.loads(host['info'] or '{}').get('gpus') and info.get('gpus')
     gpus_enabled = host['gpus_enabled']
     if first:   # premiere detection : on active les vrais GPU (pas le worker CPU)
@@ -1083,7 +1139,7 @@ async def agent_heartbeat(request: Request, host=Depends(agent)):
 
 @app.post('/api/agent/claim')
 async def agent_claim(request: Request, host=Depends(agent)):
-    b = await request.json()
+    b = await _json(request)
     if agents.pending(host):    # mise a jour en cours : plus de nouveau job pour ce host
         return {'job': None}
     job = jobs.claim(host, str(b.get('gpu')))
@@ -1109,7 +1165,7 @@ async def agent_source(job_id: int, request: Request, host=Depends(agent)):
 
 @app.post('/api/agent/jobs/{job_id}/progress')
 async def agent_progress(job_id: int, request: Request, host=Depends(agent)):
-    b = await request.json()
+    b = await _json(request)
     try:
         pct = max(0.0, min(100.0, float(b.get('progress') or 0)))
     except (TypeError, ValueError):
@@ -1121,15 +1177,22 @@ async def agent_progress(job_id: int, request: Request, host=Depends(agent)):
 
 @app.put('/api/agent/jobs/{job_id}/result')
 async def agent_result(job_id: int, request: Request, host=Depends(agent)):
-    _own_job(job_id, host, request)
-    part = jobs.upload_part(job_id)
+    j = _own_job(job_id, host, request)
+    # Un resultat valide est plus petit que la source ; l'AV1 -> HEVC peut grossir de 1000 % au plus (reglage).
+    # Au-dela, c'est un envoi anormal qui ne doit pas pouvoir remplir le disque du hub.
+    limit = (j['src_size'] or 0) * 11 + (256 << 20)
     expected = request.headers.get('content-length')
+    if expected and expected.isdigit() and int(expected) > limit:
+        raise HTTPException(413, 'resultat trop volumineux')
+    part = jobs.upload_part(job_id)
     received = 0
     try:
         with open(part, 'wb') as f:
             async for chunk in request.stream():
-                f.write(chunk)
                 received += len(chunk)
+                if received > limit:
+                    raise IOError('resultat trop volumineux')
+                f.write(chunk)
         if expected and expected.isdigit() and received != int(expected):
             raise IOError('%d octets recus sur %s' % (received, expected))
     except Exception:
@@ -1146,7 +1209,7 @@ async def agent_result(job_id: int, request: Request, host=Depends(agent)):
 
 @app.post('/api/agent/jobs/{job_id}/fail')
 async def agent_fail(job_id: int, request: Request, host=Depends(agent)):
-    b = await request.json()
+    b = await _json(request)
     jobs.fail(job_id, host['id'], str(b.get('reason', 'echec'))[:300], final=bool(b.get('final')), token=_token(request))
     return {'ok': True}
 

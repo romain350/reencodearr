@@ -45,38 +45,43 @@ def enqueue(series_names, retry_bad=False):
            'already_queued': 0, 'not_probed': 0}
     kept = config.kept_codecs(db.get_settings())
     for name in series_names:
-        batch = None
-        for e in db.q('SELECT path,size,mtime,codec,bad,probe,issues FROM episodes WHERE series=? ORDER BY path', (name,)):
-            if e['probe'] is None:
-                rep['not_probed'] += 1
-                continue
-            if e['codec'] in config.HEVC_CODECS:
-                rep['already_hevc'] += 1
-                continue
-            if e['codec'] in kept:      # av1 (sauf option AV1 -> HEVC), vp9 : le HEVC les agrandirait
-                rep['already_modern'] += 1
-                continue
-            if not retry_bad and any(i.get('src') == 'skip' for i in json.loads(e['issues'] or '[]')):
-                rep['skipped_compact'] += 1             # deja essaye : l'encodage ne faisait pas gagner de place
-                continue
-            if not e['codec'] or (e['bad'] and not retry_bad):
-                rep['skipped_bad'] += 1
-                continue
-            if batch is None:
-                batch = _batch_for(name)
-            try:
-                db.run('INSERT INTO jobs(path,series,batch,status,created,src_size,src_mtime) VALUES(?,?,?,?,?,?,?)',
-                       (e['path'], name, batch, 'queued', time.time(), e['size'], e['mtime']))
-                rep['enqueued'] += 1
-            except sqlite3.IntegrityError:
-                rep['already_queued'] += 1
+        with db.tx():       # une transaction par serie : une ecriture sur le disque au lieu d'une par episode
+            _enqueue_group(name, kept, retry_bad, rep)
     return rep
+
+
+def _enqueue_group(name, kept, retry_bad, rep):
+    batch = None
+    for e in db.q('SELECT path,size,mtime,codec,bad,probe,issues FROM episodes WHERE series=? ORDER BY path', (name,)):
+        if e['probe'] is None:
+            rep['not_probed'] += 1
+            continue
+        if e['codec'] in config.HEVC_CODECS:
+            rep['already_hevc'] += 1
+            continue
+        if e['codec'] in kept:      # av1 (sauf option AV1 -> HEVC), vp9 : le HEVC les agrandirait
+            rep['already_modern'] += 1
+            continue
+        if not retry_bad and any(i.get('src') == 'skip' for i in json.loads(e['issues'] or '[]')):
+            rep['skipped_compact'] += 1             # deja essaye : l'encodage ne faisait pas gagner de place
+            continue
+        if not e['codec'] or (e['bad'] and not retry_bad):
+            rep['skipped_bad'] += 1
+            continue
+        if batch is None:
+            batch = _batch_for(name)
+        try:
+            db.run('INSERT INTO jobs(path,series,batch,status,created,src_size,src_mtime) VALUES(?,?,?,?,?,?,?)',
+                   (e['path'], name, batch, 'queued', time.time(), e['size'], e['mtime']))
+            rep['enqueued'] += 1
+        except sqlite3.IntegrityError:
+            rep['already_queued'] += 1
 
 
 def cancel_series(series_names):
     n = 0
     for name in series_names:
-        n += len(db.q("SELECT 1 FROM jobs WHERE series=? AND status='queued'", (name,)))
+        n += db.one("SELECT COUNT(*) c FROM jobs WHERE series=? AND status='queued'", (name,))['c']
         db.run("UPDATE jobs SET status='canceled',finished=? WHERE series=? AND status='queued'", (time.time(), name))
         db.run("UPDATE jobs SET cancel=1 WHERE series=? AND status IN %s" % RUNNING_SQL, (name,))
     return n

@@ -9,7 +9,7 @@ ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
 FFMPEG = os.environ.get('FFMPEG', 'ffmpeg')
 FFPROBE = os.environ.get('FFPROBE', 'ffprobe')
-VERSION = '1.14.1'
+VERSION = '1.14.2'
 
 STAGING_DIR = os.path.join(DATA_DIR, 'staging')
 POSTER_DIR = os.path.join(DATA_DIR, 'posters')

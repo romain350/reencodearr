@@ -1,4 +1,9 @@
 data
 tests
+.git
+.github
+.env
+deploy
+docs
 __pycache__
 *.pyc

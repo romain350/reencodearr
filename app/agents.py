@@ -13,6 +13,7 @@ compter de tentative (jobs.cancel = 3).
 import json
 import os
 import re
+import shlex
 import time
 
 from . import db, jobs, journal
@@ -129,8 +130,8 @@ def view(host, info, hub_url):
             out['error'] = ("L'agent a redémarré mais est resté en %s : il est installé comme service (hors Docker) "
                             "et cette version ne sait pas se mettre à jour seule. Lancez une fois sur la machine la "
                             "commande ci-dessous ; les mises à jour suivantes se feront depuis ce bouton." % (cur or '?'))
-            out['command'] = ('sudo curl -fsSL %s/agent/agent.py -o /opt/reencodearr-agent/agent.py '
-                              '&& sudo systemctl restart reencodearr-agent' % hub_url)
+            out['command'] = ('sudo curl -fsSL %s -o /opt/reencodearr-agent/agent.py '
+                              '&& sudo systemctl restart reencodearr-agent' % shlex.quote(hub_url + '/agent/agent.py'))
         else:
             out['error'] = st['error']
     return out
