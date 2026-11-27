@@ -36,7 +36,7 @@ Pour un agent en Docker (machine Linux avec le NVIDIA Container Toolkit), utilis
 3. Chaque **agent** prend un fichier, l'encode sur son GPU (NVENC), vérifie le résultat et le renvoie au hub.
 4. Le hub contrôle le fichier (durée, pistes, langues, gain), remplace l'original, puis peut prévenir Sonarr ou Radarr.
 
-Audio, sous-titres et chapitres sont copiés tels quels. L'onglet **Statistiques** montre l'espace gagné.
+Audio, sous-titres et chapitres sont copiés tels quels (sauf les sous-titres dont le codec est inconnu de FFmpeg, qu'il ne sait pas écrire, et les jaquettes intégrées). L'onglet **Statistiques** montre l'espace gagné.
 Plus de détails : [guide complet](docs/GUIDE.md).
 
 ## Prérequis

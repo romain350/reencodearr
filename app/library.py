@@ -150,7 +150,8 @@ def summarize(d):
     st = d['streams']
     video = [s for s in st if s['codec_type'] == 'video' and not s.get('disposition', {}).get('attached_pic')]
     audio = [s for s in st if s['codec_type'] == 'audio']
-    subs = [s for s in st if s['codec_type'] == 'subtitle']
+    # un sous-titre au codec inconnu ne peut pas etre ecrit par ffmpeg : l'agent l'ignore, il ne compte donc pas
+    subs = [s for s in st if s['codec_type'] == 'subtitle' and s.get('codec_name') not in ('unknown', 'none', '', None)]
     dur = float(d.get('format', {}).get('duration') or 0)
     return {'codec': video[0]['codec_name'] if video else '',
             'width': video[0].get('width') if video else None,

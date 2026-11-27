@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 CFG = {}
 STOP = threading.Event()
 # ffmpeg ne lit que des fichiers locaux : une source piegee (liste de lecture deguisee en video) ne peut pas lui
@@ -114,6 +114,66 @@ def host_info():
 
 
 # ------------------------------------------------------------------ encodage d'un episode
+UNKNOWN_CODECS = ('unknown', 'none', '', None)
+DEFAULT_MAPS = ['-map', '0:v', '-map', '0:a', '-map', '0:s?', '-map', '0:t?']
+
+
+def ffprobe_path():
+    """ffprobe livre avec ffmpeg (meme dossier, Linux comme Windows), sinon celui du PATH."""
+    name = 'ffprobe.exe' if os.name == 'nt' else 'ffprobe'
+    path = os.path.join(os.path.dirname(CFG['ffmpeg']), name)
+    return path if os.path.isfile(path) else name
+
+
+def stream_maps(src):
+    """Pistes a garder, choisies d'apres ffprobe :
+      - les videos du film, sans les jaquettes (attached_pic) : une fois remuxees, celles-ci deviennent des pistes
+        video ordinaires et le controle du hub refusait le resultat (« pistes video different (1 -> 5) ») ;
+        la 1re video du film passe en tete pour etre la piste encodee (-c:v:0) ;
+      - tous les audios ;
+      - les sous-titres dont ffmpeg connait le codec : un sous-titre « none » fait echouer tout l'encodage
+        (« Subtitle codec none (0) is not supported ») ;
+      - les pieces jointes (polices des sous-titres ASS...) qui ont un codec ou un type MIME pour les ecrire.
+    Si ffprobe est indisponible, on garde l'ancien choix (tout copier)."""
+    try:
+        p = subprocess.run([ffprobe_path(), '-v', 'error'] + LOCAL_ONLY + [
+                           '-show_entries', 'stream=index,codec_type,codec_name:stream_disposition=attached_pic'
+                           ':stream_tags=mimetype', '-of', 'json', src],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
+        streams = json.loads(p.stdout)['streams'] if p.returncode == 0 else None
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
+        log('ffprobe impossible (%s) : toutes les pistes sont copiees' % e)
+        return DEFAULT_MAPS
+    if not streams:
+        log('ffprobe en echec (%s) : toutes les pistes sont copiees' % (p.stderr.strip()[-150:] or p.returncode))
+        return DEFAULT_MAPS
+    video, other, skipped = [], [], []
+    for s in streams:
+        kind, codec = s.get('codec_type'), s.get('codec_name')
+        mime = (s.get('tags') or {}).get('mimetype')
+        if kind == 'video':
+            (skipped if (s.get('disposition') or {}).get('attached_pic') else video).append(s)
+        elif kind == 'audio':
+            other.append(s)
+        elif kind == 'subtitle':
+            (skipped if codec in UNKNOWN_CODECS else other).append(s)
+        elif kind == 'attachment':
+            (skipped if codec in UNKNOWN_CODECS and not mime else other).append(s)
+        # pistes de donnees (timecode...) : deja ignorees par l'ancien choix
+    if not video:
+        return DEFAULT_MAPS
+    if skipped:
+        log('pistes ignorees : %s' % ', '.join('%s %s (%s)' % (s['index'], s.get('codec_type'), 'jaquette'
+            if s.get('codec_type') == 'video' else s.get('codec_name') or 'codec inconnu') for s in skipped))
+    # ordre : videos, puis audios / sous-titres / pieces jointes dans l'ordre de la source
+    order = {'audio': 0, 'subtitle': 1, 'attachment': 2}
+    other.sort(key=lambda s: (order[s['codec_type']], s['index']))
+    maps = []
+    for s in video + other:
+        maps += ['-map', '0:%d' % s['index']]
+    return maps
+
+
 def build_cmd(job, gpu, src, out, hwdecode):
     q = job['quality']
     cmd = [CFG['ffmpeg'], '-y', '-hide_banner', '-loglevel', 'error', '-nostdin', '-progress', 'pipe:1', '-nostats']
@@ -129,8 +189,8 @@ def build_cmd(job, gpu, src, out, hwdecode):
         cap = int((job.get('video_kbps') or 0) * (q.get('maxrate_pct') or 0) / 100)
         if cap > 300:
             enc += ['-maxrate', '%dk' % cap, '-bufsize', '%dk' % (cap * 2)]
-    # tout est copie (audio, sous-titres, pieces jointes, chapitres, autres pistes video) sauf la 1re video
-    cmd += LOCAL_ONLY + ['-i', src, '-map', '0:v', '-map', '0:a', '-map', '0:s?', '-map', '0:t?', '-map_chapters', '0',
+    # tout est copie (audio, sous-titres, pieces jointes, chapitres) sauf la 1re video ; voir stream_maps
+    cmd += LOCAL_ONLY + ['-i', src] + stream_maps(src) + ['-map_chapters', '0',
             '-map_metadata', '0', '-c', 'copy'] + enc + ['-max_muxing_queue_size', '2048', '-f', 'matroska', out]
     return cmd
 
@@ -144,24 +204,38 @@ def run_ffmpeg(job, cmd, report):
     dur = float(job.get('duration') or 0)
     last = 0
     speed = ''
+    cur = {'pct': 0.0}
     cancel = False
-    for line in p.stdout:
-        k, _, v = line.strip().partition('=')
-        if k == 'speed':
-            speed = v
-        if k == 'out_time_us' and v.isdigit() and dur:
-            pct = min(99.0, int(v) / 1e6 / dur * 100)
-            if time.time() - last > 5:
-                last = time.time()
-                cancel = report(pct, 'encode', speed)
-                if cancel:
-                    p.kill()
-                    break
-        if STOP.is_set():
-            p.kill()
-            break
+    # ffmpeg peut rester longtemps sans out_time_us exploitable (N/A, sortie mise en tampon) : sans signe de vie
+    # independant, le hub declarait l'agent mort et remettait en file un job toujours en cours d'encodage
+    with KeepAlive(report, 'encode', lambda: cur['pct'], on_cancel=p.kill) as ka:
+        for line in p.stdout:
+            k, _, v = line.strip().partition('=')
+            if k == 'speed':
+                speed = v
+            if k == 'out_time_us' and v.isdigit() and dur:
+                cur['pct'] = min(99.0, int(v) / 1e6 / dur * 100)
+                if time.time() - last > 5:
+                    last = time.time()
+                    if report(cur['pct'], 'encode', speed):
+                        cancel = True
+                        p.kill()
+                        break
+            if STOP.is_set() or ka.cancel.is_set():
+                p.kill()
+                break
     p.wait()
-    return p.returncode, ''.join(err)[-400:].strip(), cancel
+    return p.returncode, short_error(''.join(err)), cancel or ka.cancel.is_set()
+
+
+def short_error(text, keep=260):
+    """Debut et fin du message de ffmpeg : la cause (« Subtitle codec none... ») est souvent sur les premieres
+    lignes, et les dernieres (« Function not implemented ») ne disent pas pourquoi. Le hub garde 300 caracteres."""
+    text = text.strip()
+    if len(text) <= keep:
+        return text
+    half = (keep - 7) // 2
+    return text[:half].rstrip() + ' [...] ' + text[-half:].lstrip()
 
 
 def check_decode(out, gpu):
@@ -182,8 +256,8 @@ class KeepAlive:
     l'agent mort et redonner le job a un autre worker pendant que celui-ci ecrit encore."""
     every = 15          # secondes entre deux signes de vie (bail du hub : 300 s par defaut)
 
-    def __init__(self, report, phase, pct):
-        self.report, self.phase, self.pct = report, phase, pct
+    def __init__(self, report, phase, pct, on_cancel=None):
+        self.report, self.phase, self.pct, self.on_cancel = report, phase, pct, on_cancel
         self.cancel = threading.Event()
         self.stop = threading.Event()
 
@@ -192,6 +266,8 @@ class KeepAlive:
             while not self.stop.wait(self.every):
                 if self.report(self.pct(), self.phase, ''):
                     self.cancel.set()
+                    if self.on_cancel:
+                        self.on_cancel()
         threading.Thread(target=beat, daemon=True).start()
         return self
 

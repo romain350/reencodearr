@@ -118,6 +118,8 @@ n'est plus modifiable par l'ancien worker.
 persistante (même host, ancien jeton refusé, encodage remis en file), révocation.
 `python tests/test_agent_update.py` (environ 1 min, sans ffmpeg) : bouton de mise à jour avec un agent récent, un ancien
 agent en conteneur et un ancien agent en service systemd.
+`python tests/test_pistes.py` (quelques secondes, ffmpeg facultatif) : sous-titres au codec inconnu et jaquettes
+ignorés, pièces jointes conservées, signes de vie pendant un encodage sans progression, annulation.
 
 ## Images Docker
 
