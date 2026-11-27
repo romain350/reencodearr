@@ -5,7 +5,8 @@
     (« nombre de pistes video different (1 -> 3) ») : elles ne sont plus copiees ;
   - une piece jointe au codec inconnu mais avec un type MIME (polices...) reste copiee ;
   - ffmpeg qui ne publie aucune progression garde quand meme le bail, et l'annulation l'arrete ;
-  - le message d'erreur garde le debut de stderr (la cause) et la fin.
+  - le message d'erreur garde le debut de stderr (la cause) et la fin ;
+  - la progression se calcule depuis frame= quand ffmpeg 8.1 donne out_time_us=N/A (agent 1.5.3).
 
 La partie ffmpeg est sautee si ffmpeg/ffprobe ne sont pas installes.
 Lancer depuis le dossier du projet : python tests/test_pistes.py
@@ -61,6 +62,17 @@ rc, err, cancel = agent.run_ffmpeg({'duration': 10}, [sys.executable, '-c', 'imp
                                    lambda pct, phase, speed: True)
 assert cancel and time.time() - t < 10, (cancel, time.time() - t)
 
+# progression quand ffmpeg 8.1 donne out_time_us=N/A (piece jointe dans la sortie) : calculee depuis frame=
+fake = ('import sys, time\n'
+        'for f in (250, 500, 750):\n'
+        '    print("frame=%d\\nout_time_us=N/A\\nspeed=N/A\\nprogress=continue" % f, flush=True)\n'
+        '    time.sleep(0.05)\n')
+seen = []
+agent.run_ffmpeg({'duration': 100, 'fps': 25}, [sys.executable, '-c', fake],
+                 lambda pct, phase, speed: seen.append((pct, speed)) and False)
+assert seen and abs(seen[0][0] - 10.0) < 0.01 and seen[0][1].endswith('x'), seen
+assert agent.frame_rate({'avg_frame_rate': '24000/1001'}) > 23.9 and agent.frame_rate({'avg_frame_rate': '0/0'}) == 0
+
 # ------------------------------------------------------------------ vrai fichier (ffmpeg requis)
 if not (shutil.which('ffmpeg') and shutil.which('ffprobe')):
     print('ok (partie ffmpeg sautee : ffmpeg/ffprobe absents)')
@@ -92,7 +104,9 @@ open(src, 'wb').write(bytes(data))
 sa = library.summarize(library.ffprobe(src))
 assert (sa['video'], sa['audio'], sa['subs']) == (1, 1, 2), sa
 
-maps = agent.stream_maps(src)
+info = {}
+maps = agent.stream_maps(src, info)
+assert abs(info['fps'] - 25) < 0.01, info
 assert maps == ['-map', '0:0', '-map', '0:1', '-map', '0:2', '-map', '0:3', '-map', '0:8'], maps
 
 job = {'id': 1, 'duration': 3, 'video_kbps': 0,

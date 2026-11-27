@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.5.2'
+VERSION = '1.5.3'
 CFG = {}
 STOP = threading.Event()
 # ffmpeg ne lit que des fichiers locaux : une source piegee (liste de lecture deguisee en video) ne peut pas lui
@@ -125,7 +125,7 @@ def ffprobe_path():
     return path if os.path.isfile(path) else name
 
 
-def stream_maps(src):
+def stream_maps(src, info=None):
     """Pistes a garder, choisies d'apres ffprobe :
       - les videos du film, sans les jaquettes (attached_pic) : une fois remuxees, celles-ci deviennent des pistes
         video ordinaires et le controle du hub refusait le resultat (« pistes video different (1 -> 5) ») ;
@@ -134,10 +134,11 @@ def stream_maps(src):
       - les sous-titres dont ffmpeg connait le codec : un sous-titre « none » fait echouer tout l'encodage
         (« Subtitle codec none (0) is not supported ») ;
       - les pieces jointes (polices des sous-titres ASS...) qui ont un codec ou un type MIME pour les ecrire.
-    Si ffprobe est indisponible, on garde l'ancien choix (tout copier)."""
+    Si ffprobe est indisponible, on garde l'ancien choix (tout copier).
+    info (dict) recoit 'fps', la cadence de la video encodee, qui sert a la progression (voir run_ffmpeg)."""
     try:
         p = subprocess.run([ffprobe_path(), '-v', 'error'] + LOCAL_ONLY + [
-                           '-show_entries', 'stream=index,codec_type,codec_name:stream_disposition=attached_pic'
+                           '-show_entries', 'stream=index,codec_type,codec_name,avg_frame_rate,r_frame_rate:stream_disposition=attached_pic'
                            ':stream_tags=mimetype', '-of', 'json', src],
                            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
         streams = json.loads(p.stdout)['streams'] if p.returncode == 0 else None
@@ -162,6 +163,8 @@ def stream_maps(src):
         # pistes de donnees (timecode...) : deja ignorees par l'ancien choix
     if not video:
         return DEFAULT_MAPS
+    if info is not None:
+        info['fps'] = frame_rate(video[0])
     if skipped:
         log('pistes ignorees : %s' % ', '.join('%s %s (%s)' % (s['index'], s.get('codec_type'), 'jaquette'
             if s.get('codec_type') == 'video' else s.get('codec_name') or 'codec inconnu') for s in skipped))
@@ -172,6 +175,19 @@ def stream_maps(src):
     for s in video + other:
         maps += ['-map', '0:%d' % s['index']]
     return maps
+
+
+def frame_rate(stream):
+    """Images par seconde d'une piste ffprobe (« 24000/1001 »), 0 si inconnue."""
+    for key in ('avg_frame_rate', 'r_frame_rate'):
+        num, _, den = str(stream.get(key) or '').partition('/')
+        try:
+            fps = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 0 < fps < 1000:
+            return fps
+    return 0
 
 
 def build_cmd(job, gpu, src, out, hwdecode):
@@ -190,7 +206,10 @@ def build_cmd(job, gpu, src, out, hwdecode):
         if cap > 300:
             enc += ['-maxrate', '%dk' % cap, '-bufsize', '%dk' % (cap * 2)]
     # tout est copie (audio, sous-titres, pieces jointes, chapitres) sauf la 1re video ; voir stream_maps
-    cmd += LOCAL_ONLY + ['-i', src] + stream_maps(src) + ['-map_chapters', '0',
+    info = {}
+    maps = stream_maps(src, info)
+    job['fps'] = info.get('fps') or 0
+    cmd += LOCAL_ONLY + ['-i', src] + maps + ['-map_chapters', '0',
             '-map_metadata', '0', '-c', 'copy'] + enc + ['-max_muxing_queue_size', '2048', '-f', 'matroska', out]
     return cmd
 
@@ -205,6 +224,10 @@ def run_ffmpeg(job, cmd, report):
     last = 0
     speed = ''
     cur = {'pct': 0.0}
+    fps = float(job.get('fps') or 0)
+    frame = 0
+    out_s = None
+    start = time.time()
     cancel = False
     # ffmpeg peut rester longtemps sans out_time_us exploitable (N/A, sortie mise en tampon) : sans signe de vie
     # independant, le hub declarait l'agent mort et remettait en file un job toujours en cours d'encodage
@@ -213,9 +236,19 @@ def run_ffmpeg(job, cmd, report):
             k, _, v = line.strip().partition('=')
             if k == 'speed':
                 speed = v
-            if k == 'out_time_us' and v.isdigit() and dur:
-                cur['pct'] = min(99.0, int(v) / 1e6 / dur * 100)
-                if time.time() - last > 5:
+            elif k == 'frame' and v.isdigit():
+                frame = int(v)
+            elif k == 'out_time_us':
+                out_s = int(v) / 1e6 if v.isdigit() else None
+            elif k == 'progress' and dur:
+                # une piece jointe dans la sortie (sans horodatage) fait passer out_time_us et speed a N/A avec
+                # ffmpeg 8.1 : la position se deduit alors du nombre d'images encodees (job 3131, bloque a 0 %)
+                pos = out_s if out_s is not None else (frame / fps if fps else None)
+                if pos is not None:
+                    cur['pct'] = min(99.0, pos / dur * 100)
+                    if not speed.rstrip('x').replace('.', '', 1).isdigit() and time.time() > start:
+                        speed = '%.2fx' % (pos / (time.time() - start))
+                if pos is not None and time.time() - last > 5:
                     last = time.time()
                     if report(cur['pct'], 'encode', speed):
                         cancel = True
