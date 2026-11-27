@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -38,8 +39,10 @@ def cached(folder):
 def store(folder, data):
     base = os.path.join(config.POSTER_DIR, cache_key(folder))
     if data:
-        with open(base + '.jpg', 'wb') as f:
+        tmp = '%s.%d.tmp' % (base, threading.get_ident())     # deux affichages simultanes : jamais d'image a moitie ecrite
+        with open(tmp, 'wb') as f:
             f.write(data)
+        os.replace(tmp, base + '.jpg')
         if os.path.exists(base + '.none'):
             os.remove(base + '.none')
         return base + '.jpg'
@@ -69,10 +72,19 @@ def clean_title(folder):
     return re.sub(r'\s+', ' ', t).strip() or folder, year
 
 
+MAX_BYTES = 20 << 20      # une affiche ou une reponse d'API ne depasse jamais cette taille
+
+
 def _get(url, headers=None, timeout=15):
+    # l'adresse d'une affiche vient de la reponse d'un service tiers : jamais de file:// ni d'autre schema
+    if not str(url).lower().startswith(('https://', 'http://')):
+        raise ValueError('adresse refusee (http ou https attendu)')
     req = urllib.request.Request(url, headers=dict({'User-Agent': 'Reencodearr/1.1'}, **(headers or {})))
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+        data = r.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError('reponse trop volumineuse')
+    return data
 
 
 def _tmdb(path, params):

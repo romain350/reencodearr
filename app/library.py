@@ -8,11 +8,17 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from . import config, db, journal
 
 _scan_lock = threading.Lock()
-scan_queue = []                 # chemins relatifs en attente
+scan_queue = deque()            # chemins relatifs en attente
+_probe_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='probe')
+# Un fichier de la bibliotheque vient d'un telechargement : ffmpeg ne doit ouvrir que des fichiers locaux, meme si
+# le contenu (liste de lecture deguisee en video, par exemple) designe une adresse reseau.
+LOCAL_ONLY = ['-protocol_whitelist', 'file']
 scan_progress = {}              # serie -> [faits, total]
 _scan_level = {}                # serie -> niveau
 
@@ -115,19 +121,26 @@ def refresh():
     """Synchronise la table episodes avec le disque (stat uniquement ; le sondage vient apres)."""
     seen = set()
     known = {r['path']: (r['size'], r['mtime']) for r in db.q('SELECT path,size,mtime FROM episodes')}
+    new, changed = [], []
     for series, rel, size, mtime in iter_files():
         seen.add(rel)
         if rel not in known:
-            db.run('INSERT INTO episodes(path,series,size,mtime) VALUES(?,?,?,?)', (rel, series, size, mtime))
+            new.append((rel, series, size, mtime))
         elif known[rel] != (size, mtime):
-            db.run("UPDATE episodes SET size=?,mtime=?,probe=NULL,codec=NULL,bad=0,issues='[]' WHERE path=?",
-                   (size, mtime, rel))
-    for rel in set(known) - seen:
-        db.run('DELETE FROM episodes WHERE path=?', (rel,))
+            changed.append((size, mtime, rel))
+    gone = [(rel,) for rel in set(known) - seen]
+    if not (new or changed or gone):
+        return
+    # une seule transaction : le premier inventaire d'une grosse bibliotheque n'ecrit plus sur le disque a chaque
+    # fichier. OR IGNORE : un encodage termine pendant le parcours a pu enregistrer le meme fichier entre-temps.
+    with db.tx() as c:
+        c.executemany('INSERT OR IGNORE INTO episodes(path,series,size,mtime) VALUES(?,?,?,?)', new)
+        c.executemany("UPDATE episodes SET size=?,mtime=?,probe=NULL,codec=NULL,bad=0,issues='[]' WHERE path=?", changed)
+        c.executemany('DELETE FROM episodes WHERE path=?', gone)
 
 
 def ffprobe(path):
-    p = subprocess.run([config.FFPROBE, '-v', 'quiet', '-print_format', 'json', '-show_streams',
+    p = subprocess.run([config.FFPROBE, '-v', 'quiet'] + LOCAL_ONLY + ['-print_format', 'json', '-show_streams',
                         '-show_format', path], capture_output=True, text=True, timeout=300)
     return json.loads(p.stdout) if p.stdout.strip() else None
 
@@ -148,12 +161,15 @@ def summarize(d):
 
 def probe_pending(limit=40):
     rows = db.q('SELECT path,size,mtime FROM episodes WHERE probe IS NULL LIMIT ?', (limit,))
-    for r in rows:
+
+    def probe(r):
         try:
             d = ffprobe(abs_path(r['path']))
-            s = summarize(d) if d else None
+            return summarize(d) if d else None
         except Exception:
-            s = None
+            return None
+    # ffprobe attend surtout le disque : plusieurs fichiers a la fois, puis les ecritures dans l'ordre
+    for r, s in zip(rows, _probe_pool.map(probe, rows)):
         if s is None:
             s = {'codec': '', 'duration': 0, 'video': 0, 'audio': 0, 'subs': 0, 'alangs': []}
             issues = [{'src': 'scan', 'msg': 'fichier illisible par ffprobe'}]
@@ -183,7 +199,7 @@ def scan_episode(rel, level):
     s = summarize(d)
     if not s['codec']:
         issues.append('aucune piste video')
-    cmd = [config.FFMPEG, '-v', 'error', '-nostdin', '-progress', 'pipe:1', '-nostats', '-i', path]
+    cmd = [config.FFMPEG, '-v', 'error', '-nostdin', '-progress', 'pipe:1', '-nostats'] + LOCAL_ONLY + ['-i', path]
     cmd += ['-map', '0:v:0', '-f', 'null', '-'] if level == 'full' else ['-map', '0', '-c', 'copy', '-f', 'null', '-']
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     errs = [ln for ln in p.stderr.splitlines() if ln.strip() and not HARMLESS.search(ln)]
@@ -213,11 +229,13 @@ def scan_episode(rel, level):
 def enqueue_scan(series_names, level):
     n = 0
     with _scan_lock:
+        queued = set(scan_queue)        # liste parcourue une fois : rester rapide sur une grosse bibliotheque
         for name in series_names:
             added = 0
             for r in db.q('SELECT path FROM episodes WHERE series=?', (name,)):
-                if r['path'] not in scan_queue:
+                if r['path'] not in queued:
                     scan_queue.append(r['path'])
+                    queued.add(r['path'])
                     added += 1
             if added:
                 prev = scan_progress.get(name) or [0, 0]
@@ -232,7 +250,7 @@ def _scan_worker():
         rel = None
         with _scan_lock:
             if scan_queue:
-                rel = scan_queue.pop(0)
+                rel = scan_queue.popleft()
         if rel is None:
             time.sleep(2)
             continue
@@ -286,6 +304,7 @@ def group_complete(key):
         return False, 'des encodages sont encore en file'
     left = 0
     kept = config.kept_codecs(db.get_settings())
+    last = None         # dernier etat de job par fichier, lu en une seule requete et seulement s'il sert
     for e in eps:
         if e['probe'] is None:
             return False, 'des fichiers ne sont pas encore analyses'
@@ -293,8 +312,11 @@ def group_complete(key):
             return False, 'des fichiers defectueux restent'
         if (e['codec'] or '') in kept:
             continue
-        last = db.one('SELECT status FROM jobs WHERE path=? ORDER BY id DESC LIMIT 1', (e['path'],))
-        if not (last and last['status'] == 'skipped'):
+        if last is None:
+            last = {r['path']: r['status'] for r in db.q(
+                'SELECT j.path, j.status FROM jobs j JOIN (SELECT MAX(id) m FROM jobs WHERE path IN '
+                '(SELECT path FROM episodes WHERE series=?) GROUP BY path) x ON x.m=j.id', (key,))}
+        if last.get(e['path']) != 'skipped':
             left += 1
     if left:
         return False, '%d fichier(s) pas encore en HEVC' % left

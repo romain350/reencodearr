@@ -12,7 +12,8 @@ from . import config, db, journal, library, naming
 
 _verify_q = queue.Queue()
 ACTIVE_SQL = "('" + "','".join(config.ACTIVE) + "')"
-RUNNING_SQL = "('claimed','encoding','uploading')"
+RUNNING = ('claimed', 'encoding', 'uploading')
+RUNNING_SQL = "('" + "','".join(RUNNING) + "')"
 
 
 def staging_path(job_id, part=False):
@@ -44,38 +45,43 @@ def enqueue(series_names, retry_bad=False):
            'already_queued': 0, 'not_probed': 0}
     kept = config.kept_codecs(db.get_settings())
     for name in series_names:
-        batch = None
-        for e in db.q('SELECT path,size,mtime,codec,bad,probe,issues FROM episodes WHERE series=? ORDER BY path', (name,)):
-            if e['probe'] is None:
-                rep['not_probed'] += 1
-                continue
-            if e['codec'] in config.HEVC_CODECS:
-                rep['already_hevc'] += 1
-                continue
-            if e['codec'] in kept:      # av1 (sauf option AV1 -> HEVC), vp9 : le HEVC les agrandirait
-                rep['already_modern'] += 1
-                continue
-            if not retry_bad and any(i.get('src') == 'skip' for i in json.loads(e['issues'] or '[]')):
-                rep['skipped_compact'] += 1             # deja essaye : l'encodage ne faisait pas gagner de place
-                continue
-            if not e['codec'] or (e['bad'] and not retry_bad):
-                rep['skipped_bad'] += 1
-                continue
-            if batch is None:
-                batch = _batch_for(name)
-            try:
-                db.run('INSERT INTO jobs(path,series,batch,status,created,src_size,src_mtime) VALUES(?,?,?,?,?,?,?)',
-                       (e['path'], name, batch, 'queued', time.time(), e['size'], e['mtime']))
-                rep['enqueued'] += 1
-            except sqlite3.IntegrityError:
-                rep['already_queued'] += 1
+        with db.tx():       # une transaction par serie : une ecriture sur le disque au lieu d'une par episode
+            _enqueue_group(name, kept, retry_bad, rep)
     return rep
+
+
+def _enqueue_group(name, kept, retry_bad, rep):
+    batch = None
+    for e in db.q('SELECT path,size,mtime,codec,bad,probe,issues FROM episodes WHERE series=? ORDER BY path', (name,)):
+        if e['probe'] is None:
+            rep['not_probed'] += 1
+            continue
+        if e['codec'] in config.HEVC_CODECS:
+            rep['already_hevc'] += 1
+            continue
+        if e['codec'] in kept:      # av1 (sauf option AV1 -> HEVC), vp9 : le HEVC les agrandirait
+            rep['already_modern'] += 1
+            continue
+        if not retry_bad and any(i.get('src') == 'skip' for i in json.loads(e['issues'] or '[]')):
+            rep['skipped_compact'] += 1             # deja essaye : l'encodage ne faisait pas gagner de place
+            continue
+        if not e['codec'] or (e['bad'] and not retry_bad):
+            rep['skipped_bad'] += 1
+            continue
+        if batch is None:
+            batch = _batch_for(name)
+        try:
+            db.run('INSERT INTO jobs(path,series,batch,status,created,src_size,src_mtime) VALUES(?,?,?,?,?,?,?)',
+                   (e['path'], name, batch, 'queued', time.time(), e['size'], e['mtime']))
+            rep['enqueued'] += 1
+        except sqlite3.IntegrityError:
+            rep['already_queued'] += 1
 
 
 def cancel_series(series_names):
     n = 0
     for name in series_names:
-        n += len(db.q("SELECT 1 FROM jobs WHERE series=? AND status='queued'", (name,)))
+        n += db.one("SELECT COUNT(*) c FROM jobs WHERE series=? AND status='queued'", (name,))['c']
         db.run("UPDATE jobs SET status='canceled',finished=? WHERE series=? AND status='queued'", (time.time(), name))
         db.run("UPDATE jobs SET cancel=1 WHERE series=? AND status IN %s" % RUNNING_SQL, (name,))
     return n
@@ -191,17 +197,18 @@ def owns(j, host_id, token):
 def progress(job_id, host_id, pct, phase, speed, token=None):
     """Heartbeat d'un job : renouvelle le bail. Retourne True si l'annulation est demandee
     (ou si le job ne lui appartient plus : le worker doit alors s'arreter)."""
-    j = db.one('SELECT * FROM jobs WHERE id=?', (job_id,))
-    if not owns(j, host_id, token) or j['status'] not in ('claimed', 'encoding', 'uploading'):
-        return True
-    status = 'uploading' if phase == 'upload' else 'encoding'
-    labels = {'download': 'telechargement de la source', 'encode': 'encodage en cours',
-              'check': 'controle du decodage', 'upload': 'envoi du resultat'}
-    if j['phase'] != phase and phase in labels:
-        journal.info('queue', 'job %d : %s (%s)' % (job_id, labels[phase], j['path'].rsplit('/', 1)[-1]))
-    db.run('UPDATE jobs SET status=?,progress=?,phase=?,speed=?,lease_until=? WHERE id=?',
-           (status, pct, phase, speed, time.time() + db.get_settings()['lease_s'], job_id))
-    return bool(j['cancel'])
+    with db.tx() as c:      # lecture et ecriture ensemble : un envoi qui se termine ne doit pas etre ecrase
+        j = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not owns(j, host_id, token) or j['status'] not in RUNNING:
+            return True
+        status = 'uploading' if phase == 'upload' else 'encoding'
+        labels = {'download': 'telechargement de la source', 'encode': 'encodage en cours',
+                  'check': 'controle du decodage', 'upload': 'envoi du resultat'}
+        if j['phase'] != phase and phase in labels:
+            journal.info('queue', 'job %d : %s (%s)' % (job_id, labels[phase], j['path'].rsplit('/', 1)[-1]))
+        c.execute('UPDATE jobs SET status=?,progress=?,phase=?,speed=?,lease_until=? WHERE id=?',
+                  (status, pct, phase, speed, time.time() + db.get_settings()['lease_s'], job_id))
+        return bool(j['cancel'])
 
 
 def _record_permanent_failure(j, reason):
@@ -214,11 +221,16 @@ def _record_permanent_failure(j, reason):
 
 def fail(job_id, host_id, reason, final=False, token=None):
     """Echec cote agent : remise en file tant qu'il reste des tentatives, sinon echec definitif."""
+    with db.tx():       # le reaper et l'agent peuvent signaler le meme job en meme temps
+        _fail(job_id, host_id, reason, final, token)
+
+
+def _fail(job_id, host_id, reason, final, token):
     j = db.one('SELECT * FROM jobs WHERE id=?', (job_id,))
-    if not owns(j, host_id, token) or j['status'] not in ACTIVE_SQL_LIST:
+    # Un job deja recu ('verifying') appartient au hub : un echec signale par l'agent (reponse a l'envoi perdue,
+    # par exemple) ne doit ni effacer le fichier en cours de verification ni remettre le job en file.
+    if not owns(j, host_id, token) or j['status'] not in RUNNING:
         return
-    _rm(staging_path(job_id, True))
-    _rm(staging_path(job_id))
     if j['cancel'] == 2:     # interrompu pour laisser passer un fichier force : retour en tete, sans penalite
         journal.info('queue', 'job %d interrompu pour un fichier force, remis en file (%s)' % (
             job_id, j['path'].rsplit('/', 1)[-1]))
@@ -248,9 +260,6 @@ def fail(job_id, host_id, reason, final=False, token=None):
         _record_permanent_failure(j, reason)
 
 
-ACTIVE_SQL_LIST = config.ACTIVE
-
-
 def reaper_loop():
     while True:
         try:
@@ -263,10 +272,26 @@ def reaper_loop():
 
 
 # ------------------------------------------------------------------ verification et remplacement
-def submit_upload(job_id):
-    db.run("UPDATE jobs SET status='verifying',progress=100,phase='verification',out_size=? WHERE id=?",
-           (os.path.getsize(staging_path(job_id)), job_id))
+def upload_part(job_id):
+    """Fichier temporaire propre a un envoi : deux envois du meme job (bail expire puis job repris) n'ecrivent
+    jamais dans le meme fichier."""
+    return os.path.join(config.STAGING_DIR, '%d.%s.mkv.part' % (job_id, secrets.token_hex(6)))
+
+
+def accept_upload(job_id, host_id, token, part):
+    """Fin d'un envoi : si le job appartient toujours a cet agent, le fichier recu devient le resultat a verifier.
+    Le controle et le passage en 'verifying' se font d'un bloc : pendant un long envoi, le bail a pu expirer et le
+    job etre repris ailleurs. Retourne False si le resultat est refuse (le fichier recu est alors efface)."""
+    with db.tx() as c:
+        j = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not owns(j, host_id, token) or j['status'] not in RUNNING:
+            _rm(part)
+            return False
+        os.replace(part, staging_path(job_id))
+        c.execute("UPDATE jobs SET status='verifying',progress=100,phase='verification',out_size=? WHERE id=?",
+                  (os.path.getsize(staging_path(job_id)), job_id))
     _verify_q.put(job_id)
+    return True
 
 
 def verify_loop():

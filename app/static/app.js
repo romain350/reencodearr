@@ -118,7 +118,7 @@ async function importConfig(file) {
   const when = info.exported_at ? ` le ${esc(info.exported_at.slice(0, 16).replace('T', ' à '))}` : '';
   const go = await dialog(`<h3>Importer la configuration</h3>
     <p class="hint">Fichier exporté${when}${info.hub_version ? ' depuis la version ' + esc(info.hub_version) : ''}. Les catégories cochées remplaceront les réglages actuels.</p>
-    <div class="checks">${info.found.map(x => `<label class="row"><input type="checkbox" class="im_sec" value="${x.id}" checked> ${esc(x.label)}${x.secrets ? ' <small class="muted">(avec clés API)</small>' : ''}</label>`).join('')}</div>
+    <div class="checks">${info.found.map(x => `<label class="row"><input type="checkbox" class="im_sec" value="${esc(x.id)}" checked> ${esc(x.label)}${x.secrets ? ' <small class="muted">(avec clés API)</small>' : ''}</label>`).join('')}</div>
     ${info.secrets_included ? '' : `<p class="hint">Ce fichier ne contient pas les clés API : celles déjà enregistrées sont gardées.</p>`}`,
     [{ label: 'Annuler', value: false }, { label: 'Importer', value: true, cls: 'primary' }]);
   if (!go) return null;
@@ -364,7 +364,7 @@ function renderGrid() {
   if (!list.length && lib.list.length) { $('#grid').innerHTML = `<div class="empty wide">Aucun résultat pour « ${esc($('#search').value.trim())} ».</div>`; updateSel(); return; }
   $('#grid').innerHTML = list.map(s => `<div class="tile ${lib.sel.has(s.name) ? 'sel' : ''}" data-n="${esc(s.name)}">
       <div class="poster"><span>${esc(s.name.trim()[0] || '?').toUpperCase()}</span>
-        <img loading="lazy" src="/api/poster/${encodeURIComponent(s.name)}${kq}" alt="" onerror="this.remove()">
+        <img loading="lazy" src="/api/poster/${encodeURIComponent(s.name)}${kq}" alt="">
         <div class="state"><span class="chk">${lib.sel.has(s.name) ? '✓' : ''}</span>${tileState(s)}</div></div>
       <div class="info"><div class="name">${esc(s.name)}</div>
         ${tileInfo(s)}</div></div>`).join('');
@@ -377,6 +377,8 @@ $('#grid').onclick = e => {
   const sel = L().sel, n = t.dataset.n; sel.has(n) ? sel.delete(n) : sel.add(n);
   t.classList.toggle('sel'); $('.chk', t).textContent = sel.has(n) ? '✓' : ''; updateSel();
 };
+// affiche introuvable : l'image est retiree, la lettre reste (ecoute en capture : 'error' ne remonte pas)
+$('#grid').addEventListener('error', e => { if (e.target.tagName === 'IMG') e.target.remove(); }, true);
 $('#search').oninput = renderGrid;
 $('#sortKey').onchange = () => { L().sort = { key: $('#sortKey').value, dir: 1 }; $('#sortDir').textContent = '↓'; saveSort(); renderGrid(); };
 $('#sortDir').onclick = () => { L().sort.dir *= -1; $('#sortDir').textContent = L().sort.dir === 1 ? '↓' : '↑'; saveSort(); renderGrid(); };
@@ -486,12 +488,12 @@ async function loadHosts() {
   const d = await api('GET', '/api/hosts'); const h = JSON.stringify(d.hosts);
   if (S.hash.hosts === h) return; S.hash.hosts = h;
   if (document.activeElement && document.activeElement.closest('#hostList') && document.activeElement.type === 'checkbox') return;
-  $('#hostList').innerHTML = d.hosts.length ? d.hosts.map(hs => `<div class="host" data-id="${hs.id}">
+  $('#hostList').innerHTML = d.hosts.length ? d.hosts.map(hs => `<div class="host" data-id="${esc(hs.id)}">
     <h3 class="host-head"><span class="dot ${hs.online ? 'on' : ''}" title="${hs.online ? 'en ligne' : 'hors ligne'}"></span>${esc(hs.name)}<span class="grow"></span>
       <label class="sort small-row"><input type="checkbox" data-enabled ${hs.enabled ? 'checked' : ''}> actif</label></h3>
     <div class="muted">${hs.online ? 'en ligne' : 'hors ligne'} · ${esc(hs.platform || '')} · agent ${esc(hs.agent_version || '?')} ${hs.reusable_key ? ' · machine non persistante' : ''} · NVENC ${hs.nvenc ? 'oui' : '<span class="warn-txt">ne fonctionne pas</span>'}</div>${!hs.nvenc && hs.nvenc_error ? `<div class="ep-issue">⚠ ${esc(hs.nvenc_error)} — les GPU de ce host ne reçoivent aucun épisode.</div>` : ''}
     ${hs.gpus.map(g => `<label class="gpu"><input type="checkbox" data-gpu="${esc(g.id)}" ${hs.gpus_enabled.includes(String(g.id)) ? 'checked' : ''}>
-      <span><b>${g.id === 'cpu' ? 'CPU' : 'GPU ' + esc(g.id)}</b> ${esc(g.name)}${g.mem_total ? `<small>${g.mem_used}/${g.mem_total} Mo de VRAM utilisés</small>` : '<small>encodage logiciel : lent, à éviter sauf besoin</small>'}
+      <span><b>${g.id === 'cpu' ? 'CPU' : 'GPU ' + esc(g.id)}</b> ${esc(g.name)}${g.mem_total ? `<small>${esc(g.mem_used)}/${esc(g.mem_total)} Mo de VRAM utilisés</small>` : '<small>encodage logiciel : lent, à éviter sauf besoin</small>'}
       ${hs.running.filter(r => String(r.gpu) === String(g.id)).map(r => `<small>▶ ${esc(r.series)} — ${esc(r.file)} (${Math.round(r.progress)} %, ${esc(PHASE[r.phase] || r.phase)})</small>`).join('')}</span></label>`).join('')}
     ${hostUpdate(hs)}
     <div class="host-acts"><button class="btn small danger" data-del>Retirer ce host</button>${hs.update.outdated && !hs.update.updating ? `<button class="btn small" data-upd ${hs.online ? '' : 'disabled title="host hors ligne"'}>Mettre à jour l'agent (${esc(hs.agent_version)} → ${esc(hs.update.latest)})</button>` : ''}</div></div>`).join('') : '<div class="empty">Aucun host. Cliquez sur « Ajouter un host ».</div>';

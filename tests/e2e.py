@@ -322,8 +322,8 @@ def main():
     print('Mettre en priorite et forcer un fichier')
     check(wait(lambda: sum(h['online'] for h in api('GET', '/api/hosts')['hosts']) == 1, timeout=90), 'hostA vu hors ligne : un seul GPU disponible')
     for i in range(1, 5):
-        make_video(os.path.join(LIB, 'ShowG', 'Season 1', 'ShowG.S01E0%d.WEB.H264-GRP.mkv' % i), seconds=30,
-                   size='1280x720')     # encodage de plusieurs secondes : l'interruption a le temps d'arriver
+        make_video(os.path.join(LIB, 'ShowG', 'Season 1', 'ShowG.S01E0%d.WEB.H264-GRP.mkv' % i), seconds=120,
+                   size='1280x720')     # encodage de plusieurs secondes (machine rapide comprise) : l'interruption a le temps d'arriver
     api('POST', '/api/actions', {'action': 'scan', 'series': ['ShowG']})
     wait(lambda: series_by('ShowG') is not None and series_by('ShowG')['pending_probe'] == 0, timeout=90)
     api('PUT', '/api/settings', {'paused': True})

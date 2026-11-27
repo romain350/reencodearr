@@ -7,6 +7,8 @@ services:
     image: ghcr.io/romain350/reencodearr-agent:latest
     container_name: reencodearr-agent
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     environment:
       HUB_URL: "http://IP-DU-HUB:8095"
       ENROLL_CODE: "code-a-usage-unique"

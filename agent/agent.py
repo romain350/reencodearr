@@ -28,9 +28,12 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = '1.5.0'
+VERSION = '1.5.1'
 CFG = {}
 STOP = threading.Event()
+# ffmpeg ne lit que des fichiers locaux : une source piegee (liste de lecture deguisee en video) ne peut pas lui
+# faire ouvrir une adresse reseau depuis cette machine
+LOCAL_ONLY = ['-protocol_whitelist', 'file']
 
 
 def log(msg):
@@ -127,7 +130,7 @@ def build_cmd(job, gpu, src, out, hwdecode):
         if cap > 300:
             enc += ['-maxrate', '%dk' % cap, '-bufsize', '%dk' % (cap * 2)]
     # tout est copie (audio, sous-titres, pieces jointes, chapitres, autres pistes video) sauf la 1re video
-    cmd += ['-i', src, '-map', '0:v', '-map', '0:a', '-map', '0:s?', '-map', '0:t?', '-map_chapters', '0',
+    cmd += LOCAL_ONLY + ['-i', src, '-map', '0:v', '-map', '0:a', '-map', '0:s?', '-map', '0:t?', '-map_chapters', '0',
             '-map_metadata', '0', '-c', 'copy'] + enc + ['-max_muxing_queue_size', '2048', '-f', 'matroska', out]
     return cmd
 
@@ -166,10 +169,10 @@ def check_decode(out, gpu):
     cmd = [CFG['ffmpeg'], '-v', 'error', '-nostdin']
     if gpu != 'cpu':
         cmd += ['-hwaccel', 'cuda', '-hwaccel_device', gpu]
-    cmd += ['-i', out, '-map', '0:v:0', '-f', 'null', '-']
+    cmd += LOCAL_ONLY + ['-i', out, '-map', '0:v:0', '-f', 'null', '-']
     p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     if (p.returncode != 0 or p.stderr.strip()) and gpu != 'cpu':   # on retente sans acceleration
-        p = subprocess.run([CFG['ffmpeg'], '-v', 'error', '-nostdin', '-i', out, '-map', '0:v:0', '-f', 'null', '-'],
+        p = subprocess.run([CFG['ffmpeg'], '-v', 'error', '-nostdin'] + LOCAL_ONLY + ['-i', out, '-map', '0:v:0', '-f', 'null', '-'],
                            capture_output=True, text=True, encoding='utf-8', errors='replace')
     return None if p.returncode == 0 and not p.stderr.strip() else (p.stderr.strip()[:200] or 'erreur de decodage')
 
@@ -217,10 +220,21 @@ def download(job, dest, report):
         raise RuntimeError('telechargement incomplet (%d/%d)' % (done, total))
 
 
+class BigBlocks:
+    """Lecture par blocs de 1 Mo : http.client envoie sinon un fichier par blocs de 8 Ko (beaucoup d'appels
+    systeme pour plusieurs Go)."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def read(self, n=-1):
+        return self.f.read(1 << 20)
+
+
 def upload(job, path, report):
     size = os.path.getsize(path)
     with KeepAlive(report, 'upload', lambda: 100), open(path, 'rb') as f:   # garde le bail pendant l'envoi
-        req = urllib.request.Request('%s/api/agent/jobs/%d/result' % (CFG['hub'], job['id']), data=f, method='PUT',
+        req = urllib.request.Request('%s/api/agent/jobs/%d/result' % (CFG['hub'], job['id']), data=BigBlocks(f), method='PUT',
                                      headers=headers(job, **{'Content-Type': 'application/octet-stream',
                                                              'Content-Length': str(size)}))
         with urllib.request.urlopen(req, timeout=3600) as r:

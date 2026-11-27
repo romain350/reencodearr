@@ -4,6 +4,8 @@ services:
     image: ghcr.io/romain350/reencodearr:latest   # publiee par GitHub Actions (onglet Packages du depot)
     container_name: reencodearr
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true              # le hub n'a besoin d'aucun privilege supplementaire
     user: "${PUID:-3000}:${PGID:-0}"        # doit pouvoir ecrire dans la bibliotheque
     ports:
       - "8095:8095"

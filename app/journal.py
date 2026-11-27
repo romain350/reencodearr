@@ -1,16 +1,19 @@
 """Journal d'activite : ecrit en base (consultable dans l'onglet Journal) et sur la sortie du conteneur."""
+import re
 import time
 
 from . import db
 
 KEEP = 5000
 LEVELS = {'info': 0, 'warn': 1, 'error': 2}
+_CONTROL = re.compile(r'[\x00-\x1f\x7f]+')
 _count = [0]
 
 
 def log(level, source, message):
     """level : info | warn | error. source : auth, action, queue, agent, scan, replace, sonarr, posters, system."""
-    message = str(message)[:1000]
+    # une ligne par evenement : un nom de fichier ou un identifiant saisi ne doit pas pouvoir en fabriquer d'autres
+    message = _CONTROL.sub(' ', str(message))[:1000]
     print('[%s] %-5s %-8s %s' % (time.strftime('%d/%m %H:%M:%S'), level.upper(), source, message), flush=True)
     try:
         db.run('INSERT INTO logs(ts,level,source,message) VALUES(?,?,?,?)', (time.time(), level, source, message))
